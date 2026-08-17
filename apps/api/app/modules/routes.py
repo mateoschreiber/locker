@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -111,7 +111,7 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
         item = model(**payload)
         session.add(item)
         session.flush()
-        audit(session, f"{action}_CREATED", item)
+        audit(session, f"{action}_CREATED", cast(AuditableEntity, item))
         session.commit()
         return dump(item)
 
@@ -125,7 +125,7 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
         for key, value in payload.items():
             if key not in {"id", "created_at", "updated_at"} and hasattr(item, key):
                 setattr(item, key, value)
-        audit(session, f"{action}_UPDATED", item)
+        audit(session, f"{action}_UPDATED", cast(AuditableEntity, item))
         session.commit()
         return dump(item)
 
@@ -137,7 +137,7 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
         if not hasattr(item, "status"):
             raise HTTPException(status_code=409, detail="La entidad no admite desactivación")
         item.status = "INACTIVE"
-        audit(session, f"{action}_DEACTIVATED", item)
+        audit(session, f"{action}_DEACTIVATED", cast(AuditableEntity, item))
         session.commit()
         return dump(item)
 
