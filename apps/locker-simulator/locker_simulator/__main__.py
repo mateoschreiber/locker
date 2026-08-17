@@ -61,7 +61,13 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
         return
     client.publish(
         topic(LOCKER_ID, "events"),
-        envelope(LOCKER_ID, "COMPARTMENT_OPENED", {"simulated": True}, correlation_id, compartment_id),
+        envelope(
+            LOCKER_ID,
+            "COMPARTMENT_OPENED",
+            {"simulated": True},
+            correlation_id,
+            compartment_id,
+        ),
         qos=1,
     )
 

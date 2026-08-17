@@ -37,7 +37,15 @@ export function App() {
       setError('')
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo cargar el laboratorio') }
   }
-  useEffect(() => { if (loggedIn) { void load(); const timer = window.setInterval(() => void load(), 4000); return () => window.clearInterval(timer) } }, [loggedIn])
+  useEffect(() => {
+    if (!loggedIn) return
+    const initial = window.setTimeout(() => void load(), 0)
+    const timer = window.setInterval(() => void load(), 4000)
+    return () => {
+      window.clearTimeout(initial)
+      window.clearInterval(timer)
+    }
+  }, [loggedIn])
 
   const login = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = new FormData(event.currentTarget)

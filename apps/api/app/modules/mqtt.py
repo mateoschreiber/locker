@@ -36,7 +36,10 @@ class MqttBridge:
     def __init__(self) -> None:
         settings = get_settings()
         self.host, self.port = settings.mqtt_host, settings.mqtt_port
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="locker-api")
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
+            client_id="locker-api",
+        )
         self.client.on_connect, self.client.on_message = self._on_connect, self._on_message
 
     def start(self) -> None:
@@ -59,8 +62,8 @@ class MqttBridge:
         client: mqtt.Client,
         userdata: Any,
         flags: mqtt.ConnectFlags,
-        reason_code: mqtt.ReasonCode,
-        properties: mqtt.Properties | None,
+        reason_code: Any,
+        properties: Any,
     ) -> None:
         del userdata, flags, properties
         if not reason_code.is_failure:

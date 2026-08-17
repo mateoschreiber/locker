@@ -46,7 +46,7 @@ def audit(session: Session, action: str, entity: object) -> None:
         AuditEvent(
             action=action,
             entity_type=entity.__class__.__name__,
-            entity_id=str(entity.id),
+            entity_id=str(getattr(entity, "id")),
             metadata_json={},
         )
     )
@@ -57,7 +57,7 @@ def list_items(
 ) -> list[dict[str, object]]:
     query = select(model).order_by(model.created_at.desc())  # type: ignore[attr-defined]
     if item_status and hasattr(model, "status"):
-        query = query.where(model.status == item_status)  # type: ignore[attr-defined]
+        query = query.where(model.status == item_status)
     if q:
         fields = [
             getattr(model, field)
@@ -103,7 +103,7 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
 
     @router.post(path, status_code=status.HTTP_201_CREATED, tags=["administración"])
     def create(payload: dict[str, object], session: Session = Depends(get_db)) -> dict[str, object]:
-        item = model(**payload)  # type: ignore[call-arg]
+        item = model(**payload)
         session.add(item)
         session.flush()
         audit(session, f"{action}_CREATED", item)
@@ -296,7 +296,12 @@ def cancel_authorization(
 def create_operation(
     session: Session, authorization: Authorization | None, loan: Loan | None, command_type: str
 ) -> tuple[LockerOperation, Locker]:
-    tool_id = authorization.tool_id if authorization else loan.tool_id  # type: ignore[union-attr]
+    if authorization is not None:
+        tool_id = authorization.tool_id
+    elif loan is not None:
+        tool_id = loan.tool_id
+    else:
+        raise ValueError("Authorization or loan is required")
     placement = session.scalar(
         select(ToolPlacement)
         .where(ToolPlacement.tool_id == tool_id)
@@ -306,17 +311,20 @@ def create_operation(
         raise HTTPException(
             status_code=409, detail="No existe ubicación de origen para la herramienta"
         )
-    actual_loan = loan or Loan(
-        tool_id=authorization.tool_id,
-        user_id=authorization.user_id,
-        authorization_id=authorization.id,
-        status="CHECKOUT_PENDING",
-    )  # type: ignore[union-attr]
     if loan is None:
+        if authorization is None:
+            raise ValueError("Authorization is required for checkout")
+        actual_loan = Loan(
+            tool_id=authorization.tool_id,
+            user_id=authorization.user_id,
+            authorization_id=authorization.id,
+            status="CHECKOUT_PENDING",
+        )
         session.add(actual_loan)
         session.flush()
-        authorization.status = "CONSUMED"  # type: ignore[union-attr]
+        authorization.status = "CONSUMED"
     else:
+        actual_loan = loan
         actual_loan.status = "RETURN_PENDING"
     operation = LockerOperation(
         correlation_id=str(uuid4()),
