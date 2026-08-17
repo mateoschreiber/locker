@@ -1,5 +1,6 @@
 # Dominio
 
-La Fase 0 no crea entidades de negocio. Las siguientes fases introducirán
-sucursales, lockers, compartimientos, cerraduras, herramientas, credenciales,
-autorizaciones, préstamos y auditoría como módulos separados.
+La Fase 1 introduce sucursales, usuarios y membresías, lockers,
+compartimientos, cerraduras, cámaras, herramientas, ubicaciones,
+autorizaciones, préstamos y auditoría. Consulte [PHASE_1.md](PHASE_1.md) para
+el modelo de laboratorio actual.

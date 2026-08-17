@@ -16,6 +16,10 @@ docker compose up -d --build
 Abra `http://<IP-del-servidor>:8083`. La documentación OpenAPI está disponible
 en `/docs` y los checks de salud en `/health/live` y `/health/ready`.
 
+El panel temporal de administración usa `admin` como usuario y `admin` como
+contraseña. El seed carga el laboratorio `LAB` con 24 compartimientos y 24
+herramientas ficticias.
+
 Para detener el laboratorio sin borrar datos:
 
 ```bash
