@@ -26,7 +26,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["app", "app.api", "app.core", "app.db"]
+packages = ["app", "app.api", "app.core", "app.db", "app.modules"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -34,6 +34,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["build"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
