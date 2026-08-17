@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -113,7 +113,9 @@ class Loan(IdMixin, Base):
     __tablename__ = "loans"
     tool_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tools.id"))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
-    authorization_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("authorizations.id"), nullable=True)
+    authorization_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("authorizations.id"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), default="CHECKOUT_PENDING")
     checked_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

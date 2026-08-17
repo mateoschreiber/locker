@@ -17,14 +17,26 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column("authorizations", sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column(
+        "authorizations", sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True)
+    )
     op.add_column("loans", sa.Column("checked_out_at", sa.DateTime(timezone=True), nullable=True))
     op.add_column("loans", sa.Column("returned_at", sa.DateTime(timezone=True), nullable=True))
     op.create_table(
         "locker_operations",
         sa.Column("id", sa.UUID(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.Column("correlation_id", sa.String(80), nullable=False),
         sa.Column("command_type", sa.String(32), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),

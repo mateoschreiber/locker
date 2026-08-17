@@ -40,6 +40,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 "app/db/migrations/versions/*.py" = ["E501"]
+"app/modules/routes.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"

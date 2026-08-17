@@ -17,7 +17,19 @@ logger = logging.getLogger("locker.mqtt")
 
 
 def command_envelope(locker_id: str, compartment_id: str, correlation_id: str) -> str:
-    return json.dumps({"message_id": str(uuid4()), "correlation_id": correlation_id, "protocol_version": "1.0", "locker_id": locker_id, "compartment_id": compartment_id, "timestamp": datetime.now(UTC).isoformat(), "type": "OPEN_COMPARTMENT", "payload": {"source": "locker-api"}}, separators=(",", ":"))
+    return json.dumps(
+        {
+            "message_id": str(uuid4()),
+            "correlation_id": correlation_id,
+            "protocol_version": "1.0",
+            "locker_id": locker_id,
+            "compartment_id": compartment_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "type": "OPEN_COMPARTMENT",
+            "payload": {"source": "locker-api"},
+        },
+        separators=(",", ":"),
+    )
 
 
 class MqttBridge:
@@ -36,9 +48,20 @@ class MqttBridge:
         self.client.disconnect()
 
     def publish_open(self, locker_code: str, compartment_id: str, correlation_id: str) -> None:
-        self.client.publish(f"locker/{locker_code}/commands", command_envelope(locker_code, compartment_id, correlation_id), qos=1)
+        self.client.publish(
+            f"locker/{locker_code}/commands",
+            command_envelope(locker_code, compartment_id, correlation_id),
+            qos=1,
+        )
 
-    def _on_connect(self, client: mqtt.Client, userdata: Any, flags: mqtt.ConnectFlags, reason_code: mqtt.ReasonCode, properties: mqtt.Properties | None) -> None:
+    def _on_connect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        flags: mqtt.ConnectFlags,
+        reason_code: mqtt.ReasonCode,
+        properties: mqtt.Properties | None,
+    ) -> None:
         del userdata, flags, properties
         if not reason_code.is_failure:
             client.subscribe("locker/+/events", qos=1)
@@ -57,30 +80,78 @@ class MqttBridge:
     def confirm(self, payload: dict[str, Any]) -> None:
         correlation_id = str(payload["correlation_id"])
         with SessionLocal() as session:
-            operation = session.scalar(select(LockerOperation).where(LockerOperation.correlation_id == correlation_id))
+            operation = session.scalar(
+                select(LockerOperation).where(LockerOperation.correlation_id == correlation_id)
+            )
             if operation is None or operation.status != "PENDING":
                 return
             now = datetime.now(UTC)
             loan, tool = session.get(Loan, operation.loan_id), session.get(Tool, operation.tool_id)
-            if str(operation.compartment_id) != str(payload.get("compartment_id")) or loan is None or tool is None:
-                operation.status, operation.failure_reason = "FAILED", "Command data does not match event"
+            if (
+                str(operation.compartment_id) != str(payload.get("compartment_id"))
+                or loan is None
+                or tool is None
+            ):
+                operation.status, operation.failure_reason = (
+                    "FAILED",
+                    "Command data does not match event",
+                )
             elif operation.command_type == "CHECKOUT" and loan.status == "CHECKOUT_PENDING":
-                placement = session.scalar(select(ToolPlacement).where(ToolPlacement.tool_id == operation.tool_id, ToolPlacement.removed_at.is_(None)))
+                placement = session.scalar(
+                    select(ToolPlacement).where(
+                        ToolPlacement.tool_id == operation.tool_id,
+                        ToolPlacement.removed_at.is_(None),
+                    )
+                )
                 if placement is None:
-                    operation.status, operation.failure_reason = "FAILED", "Active placement not found"
+                    operation.status, operation.failure_reason = (
+                        "FAILED",
+                        "Active placement not found",
+                    )
                 else:
-                    placement.removed_at, tool.status, loan.status, loan.checked_out_at, operation.status = now, "ON_LOAN", "ACTIVE", now, "CONFIRMED"
+                    (
+                        placement.removed_at,
+                        tool.status,
+                        loan.status,
+                        loan.checked_out_at,
+                        operation.status,
+                    ) = now, "ON_LOAN", "ACTIVE", now, "CONFIRMED"
             elif operation.command_type == "RETURN" and loan.status == "RETURN_PENDING":
-                occupied = session.scalar(select(ToolPlacement).where(ToolPlacement.compartment_id == operation.compartment_id, ToolPlacement.removed_at.is_(None)))
+                occupied = session.scalar(
+                    select(ToolPlacement).where(
+                        ToolPlacement.compartment_id == operation.compartment_id,
+                        ToolPlacement.removed_at.is_(None),
+                    )
+                )
                 if occupied is not None:
                     operation.status, operation.failure_reason = "FAILED", "Compartment is occupied"
                 else:
-                    session.add(ToolPlacement(tool_id=operation.tool_id, branch_id=operation.branch_id, locker_id=operation.locker_id, compartment_id=operation.compartment_id, reason="LOAN_RETURN"))
-                    tool.status, loan.status, loan.returned_at, operation.status = "AVAILABLE", "RETURNED", now, "CONFIRMED"
+                    session.add(
+                        ToolPlacement(
+                            tool_id=operation.tool_id,
+                            branch_id=operation.branch_id,
+                            locker_id=operation.locker_id,
+                            compartment_id=operation.compartment_id,
+                            reason="LOAN_RETURN",
+                        )
+                    )
+                    tool.status, loan.status, loan.returned_at, operation.status = (
+                        "AVAILABLE",
+                        "RETURNED",
+                        now,
+                        "CONFIRMED",
+                    )
             else:
                 operation.status, operation.failure_reason = "FAILED", "Unexpected loan state"
             operation.confirmed_at = now
-            session.add(AuditEvent(action=f"MQTT_{operation.status}", entity_type="LockerOperation", entity_id=str(operation.id), metadata_json={"correlation_id": correlation_id}))
+            session.add(
+                AuditEvent(
+                    action=f"MQTT_{operation.status}",
+                    entity_type="LockerOperation",
+                    entity_id=str(operation.id),
+                    metadata_json={"correlation_id": correlation_id},
+                )
+            )
             session.commit()
 
 
