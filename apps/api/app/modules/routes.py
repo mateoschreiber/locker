@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -28,6 +29,10 @@ from app.modules.schemas import AuthorizationCreate, LoginRequest, PlacementCrea
 router = APIRouter(prefix="/api/v1")
 
 
+class AuditableEntity(Protocol):
+    id: UUID
+
+
 def dump(item: object) -> dict[str, object]:
     result: dict[str, object] = {}
     for column in item.__table__.columns:  # type: ignore[attr-defined]
@@ -41,12 +46,12 @@ def dump(item: object) -> dict[str, object]:
     return result
 
 
-def audit(session: Session, action: str, entity: object) -> None:
+def audit(session: Session, action: str, entity: AuditableEntity) -> None:
     session.add(
         AuditEvent(
             action=action,
             entity_type=entity.__class__.__name__,
-            entity_id=str(getattr(entity, "id")),
+            entity_id=str(entity.id),
             metadata_json={},
         )
     )
