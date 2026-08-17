@@ -4,6 +4,7 @@ from app.api.routes import api_router, router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.db.session import SessionLocal
+from app.modules.mqtt import mqtt_bridge
 from app.modules.routes import router as domain_router
 from app.modules.seed import seed_lab
 
@@ -23,3 +24,9 @@ def initialize_lab() -> None:
         seed_lab(session)
     finally:
         session.close()
+    mqtt_bridge.start()
+
+
+@app.on_event("shutdown")
+def shutdown_mqtt() -> None:
+    mqtt_bridge.stop()

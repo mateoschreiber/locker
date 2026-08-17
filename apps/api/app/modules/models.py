@@ -106,6 +106,7 @@ class Authorization(IdMixin, Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     branch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("branches.id"))
     status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Loan(IdMixin, Base):
@@ -114,6 +115,22 @@ class Loan(IdMixin, Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     authorization_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("authorizations.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="CHECKOUT_PENDING")
+    checked_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LockerOperation(IdMixin, Base):
+    __tablename__ = "locker_operations"
+    correlation_id: Mapped[str] = mapped_column(String(80), unique=True)
+    command_type: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    tool_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tools.id"))
+    loan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("loans.id"))
+    branch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("branches.id"))
+    locker_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("lockers.id"))
+    compartment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("compartments.id"))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class AuditEvent(IdMixin, Base):

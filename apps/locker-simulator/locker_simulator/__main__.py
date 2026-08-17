@@ -45,13 +45,25 @@ def on_connect(
 
 
 def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
-    del client, userdata
+    del userdata
     try:
         command = json.loads(message.payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         logger.warning("invalid_command topic=%s", message.topic)
         return
-    logger.info("diagnostic_command_received topic=%s command=%s", message.topic, command)
+    logger.info("command_received topic=%s command=%s", message.topic, command)
+    if command.get("type") != "OPEN_COMPARTMENT":
+        return
+    compartment_id = command.get("compartment_id")
+    correlation_id = command.get("correlation_id")
+    if not isinstance(compartment_id, str) or not isinstance(correlation_id, str):
+        logger.warning("open_command_missing_context command=%s", command)
+        return
+    client.publish(
+        topic(LOCKER_ID, "events"),
+        envelope(LOCKER_ID, "COMPARTMENT_OPENED", {"simulated": True}, correlation_id, compartment_id),
+        qos=1,
+    )
 
 
 def main() -> None:

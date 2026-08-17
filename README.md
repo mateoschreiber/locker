@@ -44,6 +44,12 @@ incorporar lógica específica de fabricante al dominio.
 La documentación de arquitectura, decisiones y protocolo se encuentra en
 [`docs/`](docs/).
 
+## Panel Fase 2
+
+El panel administrativo está disponible en español en `http://<IP>:8083`.
+Incluye inicio, operación simulada, inventario, lockers, administración y
+actividad. El acceso de laboratorio es `admin` / `admin`.
+
 ## Desarrollo
 
 Ejecute las validaciones desde cada aplicación:

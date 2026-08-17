@@ -1,5 +1,7 @@
 from uuid import UUID
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -60,3 +62,34 @@ class PlacementCreate(BaseModel):
     branch_id: UUID
     locker_id: UUID
     compartment_id: UUID
+
+
+class StatusUpdate(BaseModel):
+    status: str
+
+
+class AuthorizationCreate(BaseModel):
+    tool_id: UUID
+    user_id: UUID
+    branch_id: UUID
+
+
+class OperationStart(BaseModel):
+    authorization_id: UUID | None = None
+    loan_id: UUID | None = None
+
+
+class Page(BaseModel):
+    items: list[dict[str, object]]
+    total: int
+    page: int
+    page_size: int
+
+
+class OperationResponse(BaseModel):
+    id: UUID
+    correlation_id: str
+    command_type: str
+    status: str
+    loan_id: UUID
+    created_at: datetime
