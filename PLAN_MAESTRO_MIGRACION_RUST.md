@@ -260,6 +260,30 @@ broker; perfil `rust` de laboratorio sin esquema automático; auth solo en
 anónimo sin TLS (#3 → Fase 5); latidos `locker/+/status` (#15) y la
 visualización de `resolve` en el panel quedan para Fase 4.
 
+### Validación CI remota — FASE 3 VALIDADA EN CI
+
+- **Commit:** `37026b02aee1c23e2e5ea19d49c3ab604627b34d` (contiene la Fase 3
+  completa, la estabilización 3.6, la auditoría actualizada y la corrección
+  del job `rust`).
+- **Workflow:** run #18, 19-11-2026, `conclusion: success` —
+  https://github.com/mateoschreiber/locker/actions/runs/44599990488
+- **Jobs 8/8 aprobados:** `rust` (broker iniciado con `docker run` tras el
+  checkout; fmt, clippy, pruebas unitarias, integración con PostgreSQL y
+  Mosquitto, build release), `api`, `simulator`, `web`, `compose`
+  (incluye smoke Docker Rust con gate MQTT), `integration` (suite Python
+  aislada y escenario de reinicio), `parity` (contratos Python/Rust) y `mqtt`
+  (escenario completo: flujos por broker, duplicado, caída de broker,
+  reinicio real de proceso y coexistencia con propiedad única).
+- **Antecedente:** el run #16 sobre `656d31a` falló en `rust` por el montaje
+  del servicio Mosquitto antes del checkout; corregido en `37026b0`
+  (documentado arriba).
+
+Con esta ejecución, la Fase 3 queda completada localmente, validada
+localmente y **validada en CI**. Los riesgos pendientes y el alcance de las
+Fases 4 y 5 se conservan sin cambios: no se ha iniciado el cutover, Python
+sigue siendo el backend activo del laboratorio y no se ha conectado hardware
+real.
+
 
 ## Cierre de los tres hallazgos de Fase 0
 

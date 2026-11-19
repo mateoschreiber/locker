@@ -91,11 +91,10 @@ optimizaciones. El barrido TTL de Rust ahora es cada 5 s (antes cada 250 ms).
 
 ## Migración a Rust — estado
 
-Fases 0–3 completadas localmente en `656d31a` (laboratorio aislado,
-infraestructura Rust, dominio funcional con paridad de contratos, puente MQTT
-con recuperación y conciliación, estabilización 3.6). Pendiente: validación CI
-remota sobre ese SHA (los jobs `rust` con Mosquitto y `mqtt` son nuevos) y el
-cutover de la Fase 4, que retirará Python solo tras verificar paridad y
+Fases 0–3 completadas localmente y **validadas en CI** el 19-11-2026 en
+`37026b0` (run #18, 8/8 jobs aprobados:
+https://github.com/mateoschreiber/locker/actions/runs/44599990488). Pendiente:
+el cutover de la Fase 4, que retirará Python solo tras verificar paridad y
 resolver #13–#15. La regla de convivencia vigente: un único dueño por
 operación; nunca apuntar ambos backends a la misma base mutable fuera de las
 pruebas de coexistencia.
@@ -104,7 +103,8 @@ pruebas de coexistencia.
 
 1. Cerrar #19 (estados permitidos) y el volcado de contraseñas en Python
    (2 líneas, parte de #2) — pequeños y anteriores a cualquier Fase 4.
-2. Validar CI remoto de la Fase 3 sobre `656d31a`.
+2. ~~Validar CI remoto de la Fase 3~~ — hecho: run #18 sobre `37026b0`,
+   8/8 jobs aprobados.
 3. Fase 4: latidos y presencia (#15), panel de conciliación, paginación y
    carga por vista (#13, #14), medición de recursos, cutover y retirada de
    Python (#6, #17, #18 se cierran solos al retirarlo).
