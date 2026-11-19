@@ -15,25 +15,23 @@ impl Settings {
         let database_url =
             env::var("RUST_DATABASE_URL").map_err(|_| "RUST_DATABASE_URL required")?;
         let bind = env::var("RUST_BIND_ADDRESS")
-            .unwrap_or_else(|_| "0.0.0.0:8001".to_owned())
+            .unwrap_or_else(|_| "127.0.0.1:8001".to_owned())
             .parse()
             .map_err(|_| "invalid RUST_BIND_ADDRESS")?;
         let max_connections = env::var("RUST_DB_MAX_CONNECTIONS")
             .unwrap_or_else(|_| "5".to_owned())
             .parse::<u32>()
             .map_err(|_| "invalid RUST_DB_MAX_CONNECTIONS")?;
-        let timeout_seconds = env::var("RUST_DB_TIMEOUT_SECONDS")
-            .unwrap_or_else(|_| "3".to_owned())
-            .parse::<u64>()
-            .map_err(|_| "invalid RUST_DB_TIMEOUT_SECONDS")?;
-        if max_connections == 0 || timeout_seconds == 0 {
-            return Err("pool size and timeout must be positive");
+        let timeout =
+            parse_timeout(&env::var("RUST_DB_TIMEOUT_SECONDS").unwrap_or_else(|_| "3".to_owned()))?;
+        if max_connections == 0 {
+            return Err("pool size must be positive");
         }
         Ok(Self {
             database_url,
             bind,
             max_connections,
-            timeout: Duration::from_secs(timeout_seconds),
+            timeout,
         })
     }
 
@@ -45,9 +43,19 @@ impl Settings {
     }
 }
 
+fn parse_timeout(value: &str) -> Result<Duration, &'static str> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "invalid RUST_DB_TIMEOUT_SECONDS")?;
+    if !(1..=30).contains(&seconds) {
+        return Err("RUST_DB_TIMEOUT_SECONDS must be between 1 and 30");
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{parse_timeout, Settings};
     use std::time::Duration;
 
     #[tokio::test]
@@ -59,5 +67,14 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert!(settings.pool().is_err());
+    }
+
+    #[test]
+    fn timeout_is_bounded() {
+        assert_eq!(parse_timeout("1"), Ok(Duration::from_secs(1)));
+        assert_eq!(parse_timeout("30"), Ok(Duration::from_secs(30)));
+        for value in ["0", "31", "invalid"] {
+            assert!(parse_timeout(value).is_err(), "{value}");
+        }
     }
 }

@@ -72,10 +72,14 @@ MQTT, no hace seed ni ejecuta migraciones. Python sigue atendiendo todas las
 operaciones; Rust todavía no implementa préstamos ni el panel.
 
 Variables Rust: `RUST_DATABASE_URL` es la conexión PostgreSQL obligatoria;
-`RUST_BIND_ADDRESS` es el socket interno y por defecto `0.0.0.0:8001`;
+`RUST_BIND_ADDRESS` es el socket y por defecto `127.0.0.1:8001` al ejecutar
+el binario directamente; Compose usa `0.0.0.0:8001` dentro del contenedor y
+publica únicamente `127.0.0.1:18001` en el host;
 `RUST_DB_MAX_CONNECTIONS` limita el pool (predeterminado `5`);
 `RUST_DB_TIMEOUT_SECONDS` limita adquisición y consulta de salud (predeterminado
-`3`); `RUST_LOG` controla el filtro de logs estructurados (Compose usa `info`).
+`3`, rango permitido de `1` a `30` segundos). El healthcheck Docker dispone de
+`40` segundos, al menos diez de margen; `RUST_LOG` controla el filtro de logs
+estructurados (Compose usa `info`).
 Compose fija `RUST_DATABASE_URL` a la base temporal aislada y permite configurar
 los límites y `RUST_LOG` en `.env`. No incluir credenciales reales en el repositorio.
 `LOCKER_TEST_DATABASE_URL` apunta a una base aislada para la prueba de integración

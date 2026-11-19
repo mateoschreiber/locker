@@ -60,6 +60,24 @@ operaciones simuladas. Se validaron conexión disponible e indisponible, parada
 ordenada y funcionamiento independiente del laboratorio. El acceso LAN desde
 otro equipo no se ha validado y permanece deshabilitado por defecto.
 
+### Cierre definitivo de Fase 1
+
+- El binario Rust escucha por defecto en `127.0.0.1:8001`; Compose configura
+  `0.0.0.0:8001` dentro del contenedor y publica `127.0.0.1:18001` en el host.
+  Se comprobó el binario directamente en WSL y el servicio Docker en ejecución.
+- CI construye la imagen Rust opcional y ejecuta `scripts/test_rust_docker.py`
+  con PostgreSQL y red temporales: comprueba el bind, salud 200, disponibilidad
+  503 sin PostgreSQL y parada ordenada. La imagen PostgreSQL es oficial.
+- `RUST_DB_TIMEOUT_SECONDS` admite de 1 a 30 segundos; el healthcheck Docker
+  dispone de 40 segundos, con al menos diez segundos de margen.
+
+Validación local: Cargo fmt, clippy, pruebas y compilación release; imagen y
+salud Docker Rust; pruebas de API, integración y simulador; Ruff, mypy, lint,
+prueba y build web; configuración Compose y `git diff --check`. El frontend
+en `127.0.0.1:8083` y la salud Rust en `127.0.0.1:18001` respondieron 200.
+El workflow actualizado requiere una ejecución posterior en GitHub para confirmar
+el resultado remoto; no se ha iniciado la Fase 2.
+
 ## Cierre de los tres hallazgos de Fase 0
 
 1. **Exposición del panel:** Compose publica `127.0.0.1:8083` por defecto. `LOCKER_BIND_ADDRESS` permite seleccionar explícitamente una dirección privada; la configuración efectiva se comprobó tanto con el valor predeterminado como con una dirección LAN de ejemplo. El acceso LAN requiere restringir la red y no convierte las credenciales de laboratorio en seguras.

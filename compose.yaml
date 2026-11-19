@@ -124,7 +124,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8001 && printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3 && read -r response <&3 && [[ \"$$response\" == *\" 200 \"* ]]'"]
       interval: 10s
-      timeout: 5s
+      timeout: 40s
       retries: 5
 
 volumes:
