@@ -134,6 +134,126 @@ de #6 y #17) requieren ese puente; la atribución de actor es la sesión admin
 del laboratorio (sesiones reales en Fase 5); Python conserva su 500 en CRUD
 inválido (solo Rust valida) hasta el cutover de Fase 4.
 
+## Avance de Fase 3
+
+`apps/api-rust/src/mqtt.rs` implementa el puente con rumqttc y QoS 1 sobre el
+protocolo existente (mismos tópicos, envelope y correlación). La publicación
+reclama operaciones `PENDING` de forma atómica (`UPDATE ... FOR UPDATE SKIP
+LOCKED`) y marca `published_at` solo tras el PUBACK; la confirmación aplica
+los efectos de dominio en una transacción espejo de `confirm()` de Python.
+`/health/ready` exige la suscripción a `locker/+/events`, igual que Python.
+
+Máquina de estados: `PENDING → PUBLISHING → PUBLISHED → CONFIRMED/FAILED`, con
+`UNKNOWN` para lo indeterminado (PUBACK perdido por reinicio o desconexión, o
+TTL de 60 s sin confirmación). `PUBACK` nunca significa apertura física (#5 se
+mantiene). Al reiniciar: `PENDING` se republica (jamás llegó al broker);
+`PUBLISHING` huérfana pasa a `UNKNOWN` y no se re-publica. Un evento tardío
+confirma `PUBLISHED` o `UNKNOWN`; un PUBACK tardío nunca sobrescribe
+`CONFIRMED` (corrección B). El TTL jamás revierte préstamos ni libera
+reservas: lo incierto mantiene el bloqueo (corrección C).
+
+Propiedad exclusiva (auditoría #12, corrección D): la columna `origin`
+(migración `20261119_0004`, también reflejada en `schema.sql` y en el modelo
+Python para paridad de respuestas) particiona el reclamo (Rust solo reclama
+`origin='rust'`); la confirmación se particiona por estados reclamados (Python
+solo confirma `PENDING`). `locker/+/events` compartido: cada puente ignora
+correlaciones ajenas. El simulador deduplica comandos por `correlation_id`
+(en memoria; un controlador físico futuro debe persistirla). Hallazgo #9
+resuelto por verificación al publicar: código de locker repetido entre
+sucursales ⇒ operación `FAILED` sin publicar.
+
+Conciliación (corrección C): `POST /api/v1/operations/{id}/resolve` requiere
+`Bearer lab-admin-token`, `outcome` (`CONFIRMED`/`FAILED`), `reason` y
+`evidence`; audita con metadatos. `FAILED` revierte el préstamo (`CANCELLED`
+con autorización reutilizable en checkout; `ACTIVE` en devolución). Un evento
+tardío tras la resolución se ignora y se registra en el log.
+
+Pruebas ejecutadas (19-11-2026, validación local): `cargo fmt --check`,
+`cargo clippy --locked --all-targets -D warnings`, `cargo test --locked`
+(6 unitarias), `cargo test --locked -- --ignored` con PostgreSQL y Mosquitto
+reales (18 de dominio/MQTT más salud): flujo completo por broker, duplicado
+sin doble efecto, evento antes de PUBACK sin sobreescritura, tardío tras
+UNKNOWN, reinicio con `PENDING` republicada y huérfana a `UNKNOWN`, origen
+Python nunca reclamado, código ambiguo sin publicación, conciliación con
+guardas y reversión, readiness con gate MQTT. `scripts/test_rust_mqtt.py`
+(contenedores desechables, simulador real): flujo completo, evento duplicado,
+caída del broker con recuperación o `UNKNOWN` conciliable, reinicio real del
+proceso a mitad de operación, y coexistencia Python/Rust sobre la misma base
+con propiedad única verificada en ambas direcciones. `scripts/test_rust_docker.py`
+ampliado: gate MQTT de readiness (503 sin broker, 200 al volver).
+`scripts/test_phase2_parity.py` con el puente Rust apagado (`RUST_MQTT_ENABLED=false`)
+pasó 58 comparaciones con las columnas nuevas idénticas en ambos backends.
+Suite Python aislada 8/8 (incluye la prueba de migración 0004: base 0003 con
+datos, upgrade preserva, downgrade limpio); simulador 5/5 (incluye dedup);
+Ruff y mypy de la API, Ruff del simulador, `docker compose config` y
+`docker compose --profile rust config` sin problemas. La imagen Rust se
+construyó varias veces (equivalente a `cargo build --release`).
+
+Desviaciones deliberadas del contrato, exigidas por esta fase: el endpoint
+`resolve` exige `Bearer lab-admin-token` (ningún otro endpoint lo exige aún,
+hallazgo #1 diferido a Fase 5); el estado de préstamo `CANCELLED` es propio
+de la reversión Rust (Python no lo crea); los estados de operación
+`PUBLISHING`, `PUBLISHED` y `UNKNOWN` son nuevos y están documentados en el
+protocolo. El workflow CI incorporó el servicio Mosquitto al job `rust`
+(`LOCKER_TEST_MQTT_HOST`) y el job `mqtt` (`scripts/test_rust_mqtt.py`);
+requiere una ejecución en GitHub para confirmar el resultado remoto.
+
+## Fase 3.6 — Estabilización (cierre técnico)
+
+Revisión de la Fase 3 (hallazgo Must Fix + 6 menores, corregidos y verificados):
+
+- **`reason` de conciliación acotado a 255 caracteres** (límite real de
+  `locker_operations.failure_reason`, contado en caracteres igual que
+  PostgreSQL): el exceso responde 422 con mensaje de contrato en lugar del 500
+  de base de datos. Pruebas de límite exacto (pasa validación, rechazado solo
+  por estado 409) y de un carácter en exceso (422).
+- **`resolve` con `outcome: CONFIRMED` cuyas precondiciones fallan** (p. ej.
+  compartimento de devolución ocupado): la operación termina `FAILED` con su
+  `failure_reason`, el préstamo pendiente se revierte (nuevo helper compartido
+  `revert_pending_loan`, también usado por el veredicto `FAILED`), la
+  auditoría registra veredicto y estado resultante, y la respuesta expone
+  `status` y `failure_reason`. Prueba de regresión dedicada. El panel
+  administrativo debe mostrar esos campos (registrado para Fase 4).
+- **Prueba de migraciones**: el `finally` ya no enmascara errores (el engine se
+  crea antes del primer upgrade, conexión perezosa) y una prueba nueva fija
+  que un fallo de Alembic nunca se reporta como `NameError` del cleanup.
+- **Limpieza**: `command_envelope` sin referencias eliminado (la única copia
+  del envelope es la del publicador); la aserción débil del escenario Docker
+  se reemplazó por la verificación real "toda resolución manual queda en
+  auditoría con su motivo" (rama por rama).
+- **Barrido TTL cada 5 s** en lugar de cada 250 ms: una operación vencida
+  pasa a `UNKNOWN` dentro de TTL + 5 s (documentado en el protocolo), sin
+  escritura periódica innecesaria contra la base.
+- **Dedup del simulador acotado** a los últimos 10 000 `correlation_id`
+  (deque + set): dentro de la ventana deduplica, fuera de ella o tras
+  reinicio responde de nuevo. Documentado explícitamente como caché acotada,
+  no como garantía de idempotencia persistente (requisito para hardware
+  real). Pruebas de ventana, expiración y pérdida por reinicio.
+
+Validación local ejecutada (19-11-2026): `cargo fmt --check`,
+`cargo clippy --locked --all-targets -D warnings`, `cargo test --locked`
+(6 unitarias), `cargo test --locked -- --ignored --test-threads=1` con
+PostgreSQL y Mosquitto reales: **19/19** (dominio + MQTT, incluida la
+regresión nueva de conciliación). `scripts/test_rust_mqtt.py` completo
+(flujos por broker, duplicado, caída/reinicio de broker, reinicio real del
+proceso, coexistencia Python/Rust); `scripts/test_rust_docker.py` (gate
+MQTT). Suite Python aislada **9/9** (migración 0004 con datos preservados,
+downgrade limpio y error no enmascarado); simulador Ruff + **7/7** (ventana
+de dedup); Ruff y mypy de la API; paridad Python/Rust (58 comparaciones,
+puente Rust apagado); lint, prueba y build web en Node 22; `docker compose
+config` y `--profile rust`, `git diff --check` sin problemas. Todas PASSED.
+
+Sin cambios de contrato REST nuevos en 3.6; el comportamiento de `resolve`
+documentado en `docs/hardware/HARDWARE_PROTOCOL.md` es el implementado.
+Queda pendiente la validación CI remota sobre el commit de cierre (jobs
+`rust` con Mosquitto, `mqtt` nuevo, integración, paridad, compose y web).
+
+Riesgos pendientes de Fase 3 (sin cambios): UNKNOWN conservador tras caída de
+broker; perfil `rust` de laboratorio sin esquema automático; auth solo en
+`resolve` (#1 → Fase 5); dedup persistente exigible a hardware real; MQTT
+anónimo sin TLS (#3 → Fase 5); latidos `locker/+/status` (#15) y la
+visualización de `resolve` en el panel quedan para Fase 4.
+
 
 ## Cierre de los tres hallazgos de Fase 0
 

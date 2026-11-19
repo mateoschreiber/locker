@@ -133,6 +133,10 @@ class LockerOperation(IdMixin, Base):
     compartment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("compartments.id"))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Fase 3: origin partitions ownership between backends (audit #12);
+    # published_at records the broker PUBACK, never a physical confirmation.
+    origin: Mapped[str] = mapped_column(String(16), default="python")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditEvent(IdMixin, Base):

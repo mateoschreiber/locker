@@ -162,7 +162,11 @@ def main():
         created.append(PYTHON_API)
         docker('run', '-d', '--name', RUST_API, '--network', NETWORK,
                '-p', '127.0.0.1::8001', '-e', f'RUST_DATABASE_URL={RUST_DB_URL}',
-               '-e', 'RUST_BIND_ADDRESS=0.0.0.0:8001', RUST_IMAGE)
+               '-e', 'RUST_BIND_ADDRESS=0.0.0.0:8001',
+               # Paridad REST: el puente MQTT de Rust queda apagado para que las
+               # operaciones queden PENDING como en Fase 2; el ciclo MQTT se
+               # prueba con broker real en scripts/test_rust_mqtt.py.
+               '-e', 'RUST_MQTT_ENABLED=false', RUST_IMAGE)
         created.append(RUST_API)
 
         def host_port(container, port):

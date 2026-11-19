@@ -22,8 +22,17 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U locker_rust -d locker_rust_test"
           --health-interval 5s --health-timeout 3s --health-retries 10
+      mosquitto:
+        image: eclipse-mosquitto:2.0.22
+        volumes:
+          - ./infra/docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+        ports: ["1883:1883"]
+        options: >-
+          --health-cmd "mosquitto_sub -h localhost -t '$SYS/broker/version' -C 1 -W 3 >/dev/null"
+          --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       LOCKER_TEST_DATABASE_URL: postgres://locker_rust:rust_test_only@127.0.0.1:5432/locker_rust_test
+      LOCKER_TEST_MQTT_HOST: 127.0.0.1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,3 +114,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python scripts/test_phase2_parity.py
+
+  mqtt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/test_rust_mqtt.py

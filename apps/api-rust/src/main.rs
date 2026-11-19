@@ -1,4 +1,6 @@
-use locker_api_rust::{router, Settings};
+use std::sync::{atomic::AtomicBool, Arc};
+
+use locker_api_rust::{mqtt, router, Settings};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -11,9 +13,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = settings
         .pool()
         .map_err(|_| "invalid PostgreSQL configuration")?;
+    let mqtt_ready = Arc::new(AtomicBool::new(false));
+    if settings.mqtt.enabled {
+        mqtt::start(pool.clone(), settings.mqtt.clone(), mqtt_ready.clone());
+    }
     let listener = tokio::net::TcpListener::bind(settings.bind).await?;
-    tracing::info!(address = %settings.bind, "rust backend started");
-    axum::serve(listener, router(pool.clone(), settings.timeout))
+    tracing::info!(address = %settings.bind, mqtt = settings.mqtt.enabled, "rust backend started");
+    // Readiness gates on the events subscription only while the bridge runs.
+    let ready_flag = if settings.mqtt.enabled {
+        Some(mqtt_ready)
+    } else {
+        None
+    };
+    axum::serve(listener, router(pool.clone(), settings.timeout, ready_flag))
         .with_graceful_shutdown(shutdown())
         .await?;
     pool.close().await;

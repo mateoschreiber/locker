@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde_json::Value;
@@ -306,7 +306,11 @@ pub async fn return_loan(
         ));
     }
     let reserved: Option<Uuid> = query_scalar(
-        "SELECT id FROM locker_operations WHERE compartment_id = $1 AND status = 'PENDING' AND command_type = 'RETURN'",
+        // A pending-ish RETURN reserves the compartment until it reaches a
+        // terminal state; UNKNOWN keeps the reservation because the physical
+        // outcome is indeterminable (corrección C).
+        "SELECT id FROM locker_operations WHERE compartment_id = $1
+          AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN') AND command_type = 'RETURN'",
     )
     .bind(compartment_id)
     .fetch_optional(&mut *tx)
@@ -345,6 +349,193 @@ pub async fn return_loan(
     Ok((StatusCode::ACCEPTED, Json(dump_row(&operation))))
 }
 
+/// Event data that does not match the command fails the operation without
+/// touching the domain (mirror of Python's confirm mismatch branch).
+pub async fn apply_event_mismatch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &PgRow,
+) -> Result<(), sqlx::Error> {
+    let operation_id: Uuid = operation.try_get("id")?;
+    query(
+        "UPDATE locker_operations SET status = 'FAILED', confirmed_at = now(),
+                failure_reason = 'Command data does not match event'
+         WHERE id = $1 AND status IN ('PUBLISHING','PUBLISHED','UNKNOWN')",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// POST /operations/{id}/resolve — administrative reconciliation of an
+/// UNKNOWN operation (corrección C). Requires the lab-admin bearer token, a
+/// verdict, a reason and evidence; every resolution lands in the audit trail.
+/// A late MQTT event after resolution is ignored: the terminal state and the
+/// operator's attestation stand, and the event is logged for follow-up.
+pub async fn resolve_operation(
+    State(pool): State<PgPool>,
+    Path(operation_id): Path<Uuid>,
+    headers: HeaderMap,
+    ValidJson(payload): ValidJson,
+) -> Result<Json<Value>, ApiError> {
+    // Lab-only guard (audit #1 defers real auth to Phase 5); the token is the
+    // one /auth/login issues, so the frontend flow stays coherent.
+    let authorized = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "Bearer lab-admin-token");
+    if !authorized {
+        return Err(ApiError::unauthorized(
+            "Se requiere autorización administrativa",
+        ));
+    }
+    let outcome = required_text(&payload, "outcome")?;
+    if !matches!(outcome.as_str(), "CONFIRMED" | "FAILED") {
+        return Err(ApiError::validation(
+            "Campo 'outcome': debe ser CONFIRMED o FAILED",
+        ));
+    }
+    let reason = bounded_text(&payload, "reason", 255)?;
+    let evidence = required_text(&payload, "evidence")?;
+
+    let mut tx = pool.begin().await?;
+    let operation: Option<PgRow> =
+        query("SELECT * FROM locker_operations WHERE id = $1 FOR UPDATE")
+            .bind(operation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let operation = match operation {
+        Some(operation) => operation,
+        None => return Err(ApiError::not_found("La operación no existe")),
+    };
+    let status: String = operation.try_get("status")?;
+    if status != "UNKNOWN" {
+        return Err(ApiError::conflict(
+            "Solo una operación UNKNOWN puede resolverse",
+        ));
+    }
+    if outcome == "CONFIRMED" {
+        // The operator attests the physical execution with evidence; the same
+        // precondition checks as an MQTT event apply (audit #17). If they fail,
+        // the operation ends FAILED and the pending loan rolls back below so
+        // no tool or compartment stays blocked by a dead operation.
+        crate::mqtt::apply_confirmation(&mut tx, &operation).await?;
+        let applied: String = query_scalar("SELECT status FROM locker_operations WHERE id = $1")
+            .bind(operation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if applied == "FAILED" {
+            revert_pending_loan(&mut tx, &operation).await?;
+        }
+    } else {
+        query("UPDATE locker_operations SET status = 'FAILED', confirmed_at = now(), failure_reason = $2
+               WHERE id = $1 AND status = 'UNKNOWN'")
+            .bind(operation_id)
+            .bind(&reason)
+            .execute(&mut *tx)
+            .await?;
+        // The operator attests the physical action did NOT happen, so the
+        // in-flight loan may safely roll back and release its resources.
+        revert_pending_loan(&mut tx, &operation).await?;
+    }
+    let final_status: String = query_scalar("SELECT status FROM locker_operations WHERE id = $1")
+        .bind(operation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let actor = admin_actor(&mut tx).await;
+    // The audit records the operator's verdict plus the resulting status: an
+    // attested CONFIRMED whose preconditions failed ends as FAILED here.
+    crate::audit::audit_with_metadata(
+        &mut tx,
+        &format!("OPERATION_RESOLVED_{outcome}"),
+        "LockerOperation",
+        &operation_id.to_string(),
+        actor,
+        serde_json::json!({
+            "outcome": outcome,
+            "status": final_status,
+            "reason": reason,
+            "evidence": evidence,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    let row: PgRow = query("SELECT * FROM locker_operations WHERE id = $1")
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await?;
+    Ok(Json(dump_row(&row)))
+}
+
+/// Rolls back the in-flight loan of a resolved UNKNOWN operation: CHECKOUT
+/// loans are cancelled (their authorization becomes reusable) and RETURN
+/// loans go back to ACTIVE; conditional updates keep unrelated states intact.
+async fn revert_pending_loan(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation: &PgRow,
+) -> Result<(), ApiError> {
+    let command_type: String = operation.try_get("command_type")?;
+    let loan_id: Uuid = operation.try_get("loan_id")?;
+    match command_type.as_str() {
+        "CHECKOUT" => {
+            query("UPDATE loans SET status = 'CANCELLED' WHERE id = $1 AND status = 'CHECKOUT_PENDING'")
+                .bind(loan_id)
+                .execute(&mut **tx)
+                .await?;
+            let authorization_id: Option<Uuid> =
+                query_scalar("SELECT authorization_id FROM loans WHERE id = $1")
+                    .bind(loan_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .flatten();
+            if let Some(authorization_id) = authorization_id {
+                query(
+                    "UPDATE authorizations SET status = 'APPROVED'
+                           WHERE id = $1 AND status = 'CONSUMED'",
+                )
+                .bind(authorization_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        "RETURN" => {
+            query("UPDATE loans SET status = 'ACTIVE' WHERE id = $1 AND status = 'RETURN_PENDING'")
+                .bind(loan_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        _ => return Err(ApiError::conflict("Comando de operación desconocido")),
+    }
+    Ok(())
+}
+
+/// Required non-empty text field; empty strings fail like missing ones.
+fn required_text(payload: &Value, name: &str) -> Result<String, ApiError> {
+    bounded_text(payload, name, usize::MAX)
+}
+
+/// Required non-empty text field with a character limit matching the
+/// PostgreSQL column (`failure_reason` is VARCHAR(255), counted in
+/// characters, so is `chars().count`).
+fn bounded_text(payload: &Value, name: &str, max: usize) -> Result<String, ApiError> {
+    let text = payload
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::validation(&format!("Campo '{name}': se requiere texto")))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::validation(&format!(
+            "Campo '{name}': no puede estar vacío"
+        )));
+    }
+    if trimmed.chars().count() > max {
+        return Err(ApiError::validation(&format!(
+            "Campo '{name}': excede el máximo de {max} caracteres"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_operation(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -357,8 +548,8 @@ async fn insert_operation(
 ) -> Result<PgRow, ApiError> {
     let row: PgRow = query(
         "INSERT INTO locker_operations
-             (id, correlation_id, command_type, status, tool_id, loan_id, branch_id, locker_id, compartment_id)
-         VALUES ($1, $2, $3, 'PENDING', $4, $5, $6, $7, $8) RETURNING *",
+             (id, correlation_id, command_type, status, tool_id, loan_id, branch_id, locker_id, compartment_id, origin)
+         VALUES ($1, $2, $3, 'PENDING', $4, $5, $6, $7, $8, 'rust') RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(Uuid::new_v4().to_string())

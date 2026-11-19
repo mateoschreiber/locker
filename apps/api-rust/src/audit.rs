@@ -19,6 +19,26 @@ pub async fn audit(
     entity_id: &str,
     actor: Option<Uuid>,
 ) -> Result<(), sqlx::Error> {
+    audit_with_metadata(
+        conn,
+        action,
+        entity_type,
+        entity_id,
+        actor,
+        serde_json::json!({}),
+    )
+    .await
+}
+
+/// Audit with structured metadata (e.g. reconciliation reason and evidence).
+pub async fn audit_with_metadata(
+    conn: &mut PgConnection,
+    action: &str,
+    entity_type: &str,
+    entity_id: &str,
+    actor: Option<Uuid>,
+    metadata: serde_json::Value,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO audit_events (id, action, entity_type, entity_id, actor_id, metadata_json)
          VALUES ($1, $2, $3, $4, $5, $6::json)",
@@ -28,7 +48,7 @@ pub async fn audit(
     .bind(entity_type)
     .bind(entity_id)
     .bind(actor)
-    .bind(serde_json::json!({}).to_string())
+    .bind(metadata.to_string())
     .execute(conn)
     .await?;
     Ok(())

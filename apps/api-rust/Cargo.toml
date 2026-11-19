@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rumqttc = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }

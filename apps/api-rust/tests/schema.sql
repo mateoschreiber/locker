@@ -137,6 +137,8 @@ CREATE TABLE locker_operations (
     compartment_id UUID NOT NULL REFERENCES compartments (id),
     confirmed_at TIMESTAMPTZ,
     failure_reason VARCHAR(255),
+    origin VARCHAR(16) NOT NULL DEFAULT 'python',
+    published_at TIMESTAMPTZ,
     UNIQUE (correlation_id)
 );
 CREATE TABLE audit_events (

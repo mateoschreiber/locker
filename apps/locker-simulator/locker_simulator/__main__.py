@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from threading import Event
 from typing import Any
 
@@ -19,6 +20,23 @@ LOCKER_ID = os.getenv("LOCKER_ID", "LAB-LOCKER-001")
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 subscribed = Event()
+
+# QoS 1 may redeliver the same command; the logical operation is the
+# correlation_id, so duplicates are ignored. shortcut: memory-only dedup with
+# a bounded window (last SEEN_LIMIT correlations, lost on restart); a real
+# controller must persist deduplication across restarts and reject unknown
+# correlation ids (docs/hardware/HARDWARE_PROTOCOL.md).
+SEEN_LIMIT = 10_000
+seen_correlations: deque[str] = deque()
+seen_lookup: set[str] = set()
+
+
+def remember_correlation(correlation_id: str) -> None:
+    """Records a correlation id in the bounded dedup window."""
+    seen_correlations.append(correlation_id)
+    seen_lookup.add(correlation_id)
+    while len(seen_correlations) > SEEN_LIMIT:
+        seen_lookup.discard(seen_correlations.popleft())
 
 
 def publish_status(client: mqtt.Client, event_type: str) -> None:
@@ -74,6 +92,10 @@ def on_message(client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) ->
     if not isinstance(compartment_id, str) or not isinstance(correlation_id, str):
         logger.warning("open_command_missing_context command=%s", command)
         return
+    if correlation_id in seen_lookup:
+        logger.info("duplicate_command_ignored correlation_id=%s", correlation_id)
+        return
+    remember_correlation(correlation_id)
     client.publish(
         topic(LOCKER_ID, "events"),
         envelope(

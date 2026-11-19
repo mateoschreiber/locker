@@ -9,6 +9,7 @@ mod error;
 mod health;
 mod inventory;
 mod json;
+pub mod mqtt;
 mod operations;
 
 use axum::{
@@ -17,12 +18,14 @@ use axum::{
     Router,
 };
 use sqlx::PgPool;
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+use std::{sync::Arc, time::Duration};
 
-pub use config::Settings;
+pub use config::{MqttSettings, Settings};
 
 /// Full application router: health at the root, the migrated domain under `/api/v1`.
-pub fn router(pool: PgPool, timeout: Duration) -> Router {
+/// `mqtt_ready` gates `/health/ready` on the MQTT events subscription.
+pub fn router(pool: PgPool, timeout: Duration, mqtt_ready: Option<Arc<AtomicBool>>) -> Router {
     let mut api = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/me", get(auth::me))
@@ -51,6 +54,10 @@ pub fn router(pool: PgPool, timeout: Duration) -> Router {
         .route("/loans", get(operations::list_loans))
         .route("/loans/{loan_id}/return", post(operations::return_loan))
         .route("/operations", get(operations::list_operations))
+        .route(
+            "/operations/{operation_id}/resolve",
+            post(operations::resolve_operation),
+        )
         .route("/audit", get(dashboard::list_audit))
         .route("/dashboard", get(dashboard::dashboard));
     for spec in entities::ADMIN {
@@ -87,5 +94,5 @@ pub fn router(pool: PgPool, timeout: Duration) -> Router {
             );
         api = api.nest(path.as_str(), entity);
     }
-    health::router(pool.clone(), timeout).nest("/api/v1", api.with_state(pool))
+    health::router(pool.clone(), timeout, mqtt_ready).nest("/api/v1", api.with_state(pool))
 }

@@ -65,16 +65,21 @@ docker compose --profile rust stop api-rust rust-postgres
 ```
 
 `http://127.0.0.1:18001/health/live` comprueba el proceso y
-`http://127.0.0.1:18001/health/ready` consulta PostgreSQL (`503` si no responde).
-Este perfil usa una instancia PostgreSQL **separada y temporal** en memoria:
-sus datos se pierden al detenerla. No accede a la base del laboratorio, no usa
-MQTT ni hace seed. Desde la Fase 2, Rust implementa el dominio funcional
+`http://127.0.0.1:18001/health/ready` consulta PostgreSQL y la suscripción MQTT
+(`503` si cualquiera falla). Este perfil usa una instancia PostgreSQL
+**separada y temporal** en memoria: sus datos se pierden al detenerla y no
+incluye esquema ni seed (el puente reintenta la recuperación hasta que el
+esquema exista). Desde la Fase 2, Rust implementa el dominio funcional
 completo bajo `/api/v1` (autenticación, administración, inventario,
 autorizaciones, préstamos, devoluciones, operaciones, auditoría y dashboard)
-con transacciones, concurrencia e idempotencia; la publicación y confirmación
-MQTT de aperturas es Fase 3, por lo que un retiro o devolución solicitado queda
-`PENDING` hasta esa fase. **Python sigue siendo el único backend conectado al
-laboratorio**: no apunte ambos a la misma base mutable al mismo tiempo.
+con transacciones, concurrencia e idempotencia. Desde la Fase 3, Rust también
+publica y confirma aperturas por MQTT contra el mismo broker que Python, con
+el mismo protocolo y correlación; la propiedad de cada operación está
+particionada por la columna `origin` y por los estados reclamados, por lo que
+ningún backend procesa la operación del otro (ver
+[protocolo](docs/hardware/HARDWARE_PROTOCOL.md)). **Python sigue siendo el
+único backend conectado al laboratorio**: no apunte ambos a la misma base
+mutable salvo en las pruebas de coexistencia.
 
 Variables Rust: `RUST_DATABASE_URL` es la conexión PostgreSQL obligatoria;
 `RUST_BIND_ADDRESS` es el socket y por defecto `127.0.0.1:8001` al ejecutar
@@ -84,11 +89,18 @@ publica únicamente `127.0.0.1:18001` en el host;
 `RUST_DB_TIMEOUT_SECONDS` limita adquisición y consulta de salud (predeterminado
 `3`, rango permitido de `1` a `30` segundos). El healthcheck Docker dispone de
 `40` segundos, al menos diez de margen; `RUST_LOG` controla el filtro de logs
-estructurados (Compose usa `info`).
+estructurados (Compose usa `info`). Variables MQTT del puente Rust:
+`RUST_MQTT_ENABLED` (`true` por defecto; `false` deja las operaciones
+`PENDING` como en Fase 2, usado por la paridad REST), `RUST_MQTT_HOST` /
+`RUST_MQTT_PORT` (el broker compartido), `RUST_MQTT_CLIENT_ID`
+(predeterminado `locker-api-rust`) y `RUST_MQTT_CONFIRM_TIMEOUT_SECONDS`
+(predeterminado `60`, rango `1` a `600`) que vence `PUBLISHED` a `UNKNOWN`
+sin liberar recursos.
 Compose fija `RUST_DATABASE_URL` a la base temporal aislada y permite configurar
 los límites y `RUST_LOG` en `.env`. No incluir credenciales reales en el repositorio.
 `LOCKER_TEST_DATABASE_URL` apunta a una base aislada para las pruebas de
-integración Rust (salud y dominio) y solo se necesita al ejecutarlas.
+integración Rust (salud, dominio y MQTT) y solo se necesita al ejecutarlas;
+`LOCKER_TEST_MQTT_HOST` apunta al broker aislado de esas pruebas.
 
 Las pruebas de integración crean PostgreSQL y MQTT aislados, sin publicar puertos
 ni usar los volúmenes del laboratorio:
@@ -100,16 +112,29 @@ python scripts/test_docker_restart.py
 ```
 
 La paridad de contratos Python/Rust se comprueba con ambos backends contra la
-misma base aislada (listados, flujo de escritura, errores y detalle de mensajes):
+misma base aislada (listados, flujo de escritura, errores y detalle de mensajes),
+con el puente MQTT de Rust apagado para comparar solo los contratos REST:
 
 ```bash
 python scripts/test_phase2_parity.py
 ```
 
+El ciclo MQTT completo de Rust se valida con PostgreSQL, Mosquitto, el
+simulador real y procesos reales: flujo completo, evento duplicado, caída y
+recuperación del broker, reinicio del backend a mitad de una operación
+(republicación segura de `PENDING`, `UNKNOWN` para lo incierto, conciliación
+por REST) y coexistencia Python/Rust sobre una base compartida con propiedad
+única por operación:
+
+```bash
+python scripts/test_rust_mqtt.py
+```
+
 Para revisar una base existente sin cambiarla, utilice una cuenta PostgreSQL de
 solo lectura y ejecute `psql -v ON_ERROR_STOP=1 -f apps/api/integrity.sql` contra
 la base indicada expresamente. El informe muestra conteos, no corrige datos;
-operaciones pendientes o fallidas requieren revisión y no necesariamente son corrupción.
+operaciones `UNKNOWN` o fallidas requieren conciliación (ver
+[protocolo](docs/hardware/HARDWARE_PROTOCOL.md)) y no necesariamente son corrupción.
 
 ## Arquitectura
 
