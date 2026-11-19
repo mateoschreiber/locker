@@ -194,9 +194,15 @@ Desviaciones deliberadas del contrato, exigidas por esta fase: el endpoint
 hallazgo #1 diferido a Fase 5); el estado de préstamo `CANCELLED` es propio
 de la reversión Rust (Python no lo crea); los estados de operación
 `PUBLISHING`, `PUBLISHED` y `UNKNOWN` son nuevos y están documentados en el
-protocolo. El workflow CI incorporó el servicio Mosquitto al job `rust`
+protocolo. El workflow CI incorporó Mosquitto al job `rust`
 (`LOCKER_TEST_MQTT_HOST`) y el job `mqtt` (`scripts/test_rust_mqtt.py`);
-requiere una ejecución en GitHub para confirmar el resultado remoto.
+requiere una ejecución en GitHub para confirmar el resultado remoto. El primer
+intento (run 16 sobre `656d31a`) falló en el job `rust`: los `services` se crean
+antes de `actions/checkout` y no pueden montar `infra/docker/mosquitto.conf`;
+el broker se inicia ahora con `docker run` tras el checkout (montaje explícito
+de solo lectura, puerto en `127.0.0.1:1883`, espera de conexión MQTT y limpieza
+con `if: always()`), manteniendo el servicio PostgreSQL y los comandos de Cargo
+intactos.
 
 ## Fase 3.6 — Estabilización (cierre técnico)
 
