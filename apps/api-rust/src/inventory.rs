@@ -100,6 +100,11 @@ pub async fn create_placement(
             return Err(ApiError::validation(check.2));
         }
     }
+    // Serialize against concurrent returns targeting the same compartment.
+    query("SELECT id FROM compartments WHERE id = $1 FOR UPDATE")
+        .bind(compartment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let tool_active: Option<Uuid> =
         query_scalar("SELECT id FROM tool_placements WHERE tool_id = $1 AND removed_at IS NULL")
             .bind(tool_id)

@@ -91,8 +91,9 @@ declarar éxito físico.
 Hallazgos resueltos en Rust dentro de esta fase: **#7** (bloqueo `FOR UPDATE`
 sobre autorización y herramienta, único préstamo activo por herramienta, prueba
 concurrente con un solo préstamo), **#8** (jerarquía sucursal–locker–compartimiento
-validada en la ubicación y compartimento reservado u ocupado rechazado antes de
-ordenar la devolución), **#10** (todo evento de auditoría registra `actor_id`),
+validada en la ubicación, compartimento reservado u ocupado rechazado antes de
+ordenar la devolución, y bloqueo `FOR UPDATE` de la fila del compartimento para
+que devoluciones y ubicaciones concurrentes al mismo destino se serialicen), **#10** (todo evento de auditoría registra `actor_id`),
 **#11** (contratos CRUD validados: campos requeridos, tipos, longitudes, UUID,
 FK inexistente → 422, duplicado → 409), **#17 parcial** (transiciones y fallos
 explícitos sin estado parcial; la conciliación de `PENDING` depende del puente
@@ -110,18 +111,22 @@ compara ambos backends contra la misma base aislada y verifica estas desviacione
 Regla de consumidor único vigente: Python sigue atendiendo el laboratorio;
 Rust se prueba contra bases aisladas. No conectar ambos a la misma base mutable.
 
-Validación local ejecutada (19-11-2026): `cargo fmt --check`, `cargo clippy
---locked --all-targets -D warnings`, `cargo test --locked` (7 unitarias) y
-`cargo test --locked -- --ignored` con PostgreSQL aislado (7 de dominio + salud)
-pasaron; build release validado al construir la imagen Docker; la suite Python
-de integración aislada pasó (7 pruebas); `scripts/test_phase2_parity.py` pasó
-58 comparaciones contra la misma base (listados en tres estados, login, flujo
-retiro/devolución, siete contratos de error con mensajes idénticos, detalle de
-locker e historial); lint, build y prueba web pasaron; `docker compose config`
-y `git diff --check` sin problemas. El workflow con el job `parity` nuevo
-requiere una ejecución en GitHub para confirmar el resultado remoto. No se
-ejecutó `scripts/test_rust_docker.py` localmente: el healthcheck no cambió y
-CI ya lo ejecuta.
+Validación local ejecutada (19-11-2026, cierre de Fase 2): `cargo fmt --check`,
+`cargo clippy --locked --all-targets -D warnings`, `cargo test --locked`
+(6 unitarias) y `cargo test --locked -- --ignored` con PostgreSQL aislado
+(8 de dominio — incluye una carrera de devoluciones al mismo compartimento —
+más salud) pasaron; build release validado al construir la imagen Docker y
+`scripts/test_rust_docker.py` pasó (bind loopback, 200/200, 503 sin PostgreSQL,
+parada ordenada); la suite Python de integración aislada pasó (7 pruebas);
+`scripts/test_phase2_parity.py` pasó 58 comparaciones contra la misma base
+(listados en tres estados, login, flujo retiro/devolución, siete contratos de
+error con mensajes idénticos, detalle de locker e historial); lint, build y
+prueba web pasaron; `docker compose config` y `git diff --check` sin problemas.
+La revisión de cierre corrigió además dos defectos de la primera iteración:
+campos ausentes o no texto en login responden 422 (paridad con Python) y la
+reserva de compartimento es a prueba de concurrencia. El workflow con el job
+`parity` nuevo requiere una ejecución en GitHub para confirmar el resultado
+remoto.
 
 Riesgos pendientes de Fase 2: las operaciones quedan `PENDING` sin puente MQTT
 (Fase 3); la conciliación de operaciones colgadas y la entrega durable (resto

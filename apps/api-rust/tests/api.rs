@@ -603,6 +603,70 @@ async fn authorization_transitions_and_idempotent_checkout() {
 
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn concurrent_returns_to_one_compartment_create_a_single_operation() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    // Two active loans whose tools both came out of the same compartment.
+    let tool3 = Uuid::new_v4();
+    query("INSERT INTO tools (id, asset_code, name, status) VALUES ($1, 'TOOL-003', 'T', 'AVAILABLE')")
+        .bind(tool3)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut loans = Vec::new();
+    for tool in [lab.tool, tool3] {
+        let loan = Uuid::new_v4();
+        query("INSERT INTO loans (id, tool_id, user_id, authorization_id, status, checked_out_at) VALUES ($1, $2, $3, NULL, 'ACTIVE', now())")
+            .bind(loan)
+            .bind(tool)
+            .bind(lab.admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        place(&pool, tool, lab.branch, lab.locker, lab.compartment).await;
+        query("UPDATE tool_placements SET removed_at = now() WHERE tool_id = $1")
+            .bind(tool)
+            .execute(&pool)
+            .await
+            .unwrap();
+        loans.push(loan);
+    }
+
+    let mut tasks = Vec::new();
+    for loan in loans {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            action(&app, &format!("/api/v1/loans/{loan}/return")).await
+        }));
+    }
+    let mut accepted = 0;
+    let mut conflict = 0;
+    for task in tasks {
+        let (status, value) = task.await.unwrap();
+        match status {
+            StatusCode::ACCEPTED => accepted += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            _ => panic!("unexpected status {status}: {value}"),
+        }
+    }
+    assert_eq!(
+        accepted, 1,
+        "two pending returns accepted for one compartment"
+    );
+    assert_eq!(conflict, 1);
+    let returns: i64 = count(
+        &pool,
+        "SELECT COUNT(*) FROM locker_operations WHERE command_type = 'RETURN'",
+    )
+    .await;
+    assert_eq!(
+        returns, 1,
+        "compartment reservation race duplicated operations"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn concurrent_checkouts_create_a_single_loan() {
     let (pool, app, _guard) = setup().await;
     let lab = seed(&pool).await;

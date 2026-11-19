@@ -14,14 +14,8 @@ pub async fn login(
     State(pool): State<PgPool>,
     ValidJson(payload): ValidJson,
 ) -> Result<Json<Value>, ApiError> {
-    let username = payload
-        .get("username")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let password = payload
-        .get("password")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let username = text_field(&payload, "username")?;
+    let password = text_field(&payload, "password")?;
     let mut tx = pool.begin().await?;
     let row: Option<PgRow> = query("SELECT * FROM users WHERE username = $1")
         .bind(username)
@@ -58,4 +52,13 @@ pub async fn me(State(pool): State<PgPool>) -> Result<Json<Value>, ApiError> {
         .await?;
     let row = row.ok_or_else(|| ApiError::not_found("Administrador no encontrado"))?;
     Ok(Json(dump_row(&row)))
+}
+
+/// Required text field: missing or non-string values are a 422, like Python's
+/// LoginRequest, instead of silently failing authentication with 401.
+fn text_field<'a>(payload: &'a Value, name: &str) -> Result<&'a str, ApiError> {
+    payload
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::validation(&format!("Campo '{name}': se requiere texto")))
 }

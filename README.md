@@ -144,9 +144,9 @@ cd apps/api-rust && cargo fmt --check && cargo clippy --locked --all-targets -- 
 
 La prueba Rust con PostgreSQL se ejecuta explícitamente con
 `LOCKER_TEST_DATABASE_URL` apuntando a una base aislada y
-`cargo test --locked -- --ignored`; cubre salud y las 7 pruebas del dominio
-(auth/admin, colocaciones, autorizaciones, checkout idempotente, concurrencia,
-devoluciones y dashboard). CI proporciona esa base; sin ella la prueba
+`cargo test --locked -- --ignored`; cubre salud y las 8 pruebas del dominio
+(auth/admin, colocaciones, autorizaciones, checkout idempotente, concurrencia
+de retiros y de devoluciones, devoluciones y dashboard). CI proporciona esa base; sin ella la prueba
 aparece como ignorada, no como validación de conexión.
 
 Consulte [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar cambios y

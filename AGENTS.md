@@ -6,3 +6,4 @@
 - Actualizar el README ante cambios de funcionalidades, configuración, requisitos o uso; documentar las variables de entorno nuevas.
 - Preferir soluciones simples y eficientes; ejecutar las pruebas relevantes y usar Docker cuando corresponda.
 - Mantener `admin:admin` exclusivamente en el laboratorio. No publicar en Internet ni conectar hardware real hasta resolver los riesgos conocidos.
+-Todas las crdenciales deben ser admin:admin, eso luego se corrige al entrar a productivo

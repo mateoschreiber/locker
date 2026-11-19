@@ -288,6 +288,12 @@ pub async fn return_loan(
         }
     };
     let compartment_id: Uuid = placement.try_get("compartment_id")?;
+    // Serialize concurrent returns/placements into the same compartment so the
+    // occupancy and reservation checks below cannot race each other.
+    query("SELECT id FROM compartments WHERE id = $1 FOR UPDATE")
+        .bind(compartment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let occupied: Option<Uuid> = query_scalar(
         "SELECT id FROM tool_placements WHERE compartment_id = $1 AND removed_at IS NULL",
     )
