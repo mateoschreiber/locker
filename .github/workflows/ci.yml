@@ -99,3 +99,9 @@ jobs:
       - if: always()
         run: docker compose -p locker-phase0-ci -f compose.test.yaml down -v
       - run: python scripts/test_docker_restart.py
+
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/test_phase2_parity.py

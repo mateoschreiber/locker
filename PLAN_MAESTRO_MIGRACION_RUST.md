@@ -78,6 +78,58 @@ en `127.0.0.1:8083` y la salud Rust en `127.0.0.1:18001` respondieron 200.
 El workflow actualizado requiere una ejecución posterior en GitHub para confirmar
 el resultado remoto; no se ha iniciado la Fase 2.
 
+## Avance de Fase 2
+
+`apps/api-rust` implementa el dominio funcional completo bajo `/api/v1`
+(Axum/SQLx/PostgreSQL): autenticación, CRUD administrativo validado para las
+9 entidades, ubicaciones con jerarquía verificada, historial, detalle de locker,
+autorizaciones con transiciones, retiro, préstamos, devolución, operaciones,
+auditoría con actor y dashboard. El puente MQTT de aperturas y su confirmación
+siguen en Fase 3: una operación solicitada queda registrada como `PENDING`, sin
+declarar éxito físico.
+
+Hallazgos resueltos en Rust dentro de esta fase: **#7** (bloqueo `FOR UPDATE`
+sobre autorización y herramienta, único préstamo activo por herramienta, prueba
+concurrente con un solo préstamo), **#8** (jerarquía sucursal–locker–compartimiento
+validada en la ubicación y compartimento reservado u ocupado rechazado antes de
+ordenar la devolución), **#10** (todo evento de auditoría registra `actor_id`),
+**#11** (contratos CRUD validados: campos requeridos, tipos, longitudes, UUID,
+FK inexistente → 422, duplicado → 409), **#17 parcial** (transiciones y fallos
+explícitos sin estado parcial; la conciliación de `PENDING` depende del puente
+de Fase 3), **#6 parcial** (operación y préstamo transaccionales, reintentos
+idempotentes devuelven la misma operación; la entrega MQTT durable es Fase 3),
+**#18 parcial** (no se eliminaron esquemas sin uso; se retiran con Python en
+Fase 4). #5 se mantiene por diseño: una apertura simulada no demuestra movimiento.
+
+Desviaciones deliberadas del contrato Python, exigidas por esta fase:
+`password` nunca se serializa en respuestas; un reintento de retiro o devolución
+devuelve la operación existente (202) en lugar de 409; los errores de validación
+responden 422/409 con `detail` en lugar del 500 de Python. `scripts/test_phase2_parity.py`
+compara ambos backends contra la misma base aislada y verifica estas desviaciones.
+
+Regla de consumidor único vigente: Python sigue atendiendo el laboratorio;
+Rust se prueba contra bases aisladas. No conectar ambos a la misma base mutable.
+
+Validación local ejecutada (19-11-2026): `cargo fmt --check`, `cargo clippy
+--locked --all-targets -D warnings`, `cargo test --locked` (7 unitarias) y
+`cargo test --locked -- --ignored` con PostgreSQL aislado (7 de dominio + salud)
+pasaron; build release validado al construir la imagen Docker; la suite Python
+de integración aislada pasó (7 pruebas); `scripts/test_phase2_parity.py` pasó
+58 comparaciones contra la misma base (listados en tres estados, login, flujo
+retiro/devolución, siete contratos de error con mensajes idénticos, detalle de
+locker e historial); lint, build y prueba web pasaron; `docker compose config`
+y `git diff --check` sin problemas. El workflow con el job `parity` nuevo
+requiere una ejecución en GitHub para confirmar el resultado remoto. No se
+ejecutó `scripts/test_rust_docker.py` localmente: el healthcheck no cambió y
+CI ya lo ejecuta.
+
+Riesgos pendientes de Fase 2: las operaciones quedan `PENDING` sin puente MQTT
+(Fase 3); la conciliación de operaciones colgadas y la entrega durable (resto
+de #6 y #17) requieren ese puente; la atribución de actor es la sesión admin
+del laboratorio (sesiones reales en Fase 5); Python conserva su 500 en CRUD
+inválido (solo Rust valida) hasta el cutover de Fase 4.
+
+
 ## Cierre de los tres hallazgos de Fase 0
 
 1. **Exposición del panel:** Compose publica `127.0.0.1:8083` por defecto. `LOCKER_BIND_ADDRESS` permite seleccionar explícitamente una dirección privada; la configuración efectiva se comprobó tanto con el valor predeterminado como con una dirección LAN de ejemplo. El acceso LAN requiere restringir la red y no convierte las credenciales de laboratorio en seguras.

@@ -68,8 +68,13 @@ docker compose --profile rust stop api-rust rust-postgres
 `http://127.0.0.1:18001/health/ready` consulta PostgreSQL (`503` si no responde).
 Este perfil usa una instancia PostgreSQL **separada y temporal** en memoria:
 sus datos se pierden al detenerla. No accede a la base del laboratorio, no usa
-MQTT, no hace seed ni ejecuta migraciones. Python sigue atendiendo todas las
-operaciones; Rust todavía no implementa préstamos ni el panel.
+MQTT ni hace seed. Desde la Fase 2, Rust implementa el dominio funcional
+completo bajo `/api/v1` (autenticación, administración, inventario,
+autorizaciones, préstamos, devoluciones, operaciones, auditoría y dashboard)
+con transacciones, concurrencia e idempotencia; la publicación y confirmación
+MQTT de aperturas es Fase 3, por lo que un retiro o devolución solicitado queda
+`PENDING` hasta esa fase. **Python sigue siendo el único backend conectado al
+laboratorio**: no apunte ambos a la misma base mutable al mismo tiempo.
 
 Variables Rust: `RUST_DATABASE_URL` es la conexión PostgreSQL obligatoria;
 `RUST_BIND_ADDRESS` es el socket y por defecto `127.0.0.1:8001` al ejecutar
@@ -82,8 +87,8 @@ publica únicamente `127.0.0.1:18001` en el host;
 estructurados (Compose usa `info`).
 Compose fija `RUST_DATABASE_URL` a la base temporal aislada y permite configurar
 los límites y `RUST_LOG` en `.env`. No incluir credenciales reales en el repositorio.
-`LOCKER_TEST_DATABASE_URL` apunta a una base aislada para la prueba de integración
-Rust y solo se necesita al ejecutar esa prueba.
+`LOCKER_TEST_DATABASE_URL` apunta a una base aislada para las pruebas de
+integración Rust (salud y dominio) y solo se necesita al ejecutarlas.
 
 Las pruebas de integración crean PostgreSQL y MQTT aislados, sin publicar puertos
 ni usar los volúmenes del laboratorio:
@@ -92,6 +97,13 @@ ni usar los volúmenes del laboratorio:
 docker compose -p locker-phase0-test -f compose.test.yaml up --build --abort-on-container-exit --exit-code-from tests
 docker compose -p locker-phase0-test -f compose.test.yaml down -v
 python scripts/test_docker_restart.py
+```
+
+La paridad de contratos Python/Rust se comprueba con ambos backends contra la
+misma base aislada (listados, flujo de escritura, errores y detalle de mensajes):
+
+```bash
+python scripts/test_phase2_parity.py
 ```
 
 Para revisar una base existente sin cambiarla, utilice una cuenta PostgreSQL de
@@ -113,7 +125,7 @@ incorporar lógica específica de fabricante al dominio.
 La documentación de arquitectura, decisiones y protocolo se encuentra en
 [`docs/`](docs/).
 
-## Panel Fase 2
+## Panel Fase 2 (interfaz)
 
 El panel administrativo está disponible en español en `http://127.0.0.1:8083`.
 Incluye inicio, operación simulada, inventario, lockers, administración y
@@ -132,7 +144,9 @@ cd apps/api-rust && cargo fmt --check && cargo clippy --locked --all-targets -- 
 
 La prueba Rust con PostgreSQL se ejecuta explícitamente con
 `LOCKER_TEST_DATABASE_URL` apuntando a una base aislada y
-`cargo test --locked -- --ignored`. CI proporciona esa base; sin ella la prueba
+`cargo test --locked -- --ignored`; cubre salud y las 7 pruebas del dominio
+(auth/admin, colocaciones, autorizaciones, checkout idempotente, concurrencia,
+devoluciones y dashboard). CI proporciona esa base; sin ella la prueba
 aparece como ignorada, no como validación de conexión.
 
 Consulte [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar cambios y
