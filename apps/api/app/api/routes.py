@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import get_settings
 from app.db.session import get_engine
+from app.modules.mqtt import mqtt_bridge
 
 router = APIRouter()
 api_router = APIRouter(prefix="/api/v1")
@@ -30,6 +31,8 @@ def readiness() -> dict[str, str]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Laboratory dependencies are unavailable",
         ) from error
+    if not mqtt_bridge.subscribed.is_set():
+        raise HTTPException(status_code=503, detail="MQTT event subscription is not ready")
     return {"status": "ready"}
 
 

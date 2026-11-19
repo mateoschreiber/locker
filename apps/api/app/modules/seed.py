@@ -1,7 +1,10 @@
-from sqlalchemy import select
+import os
+
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.modules.models import (
+    Base,
     Branch,
     Camera,
     Compartment,
@@ -16,6 +19,12 @@ from app.modules.models import (
 
 
 def seed_lab(session: Session) -> None:
+    # The demo dataset is only safe to install into an empty domain database.
+    tables = ", ".join(Base.metadata.tables)
+    session.execute(text(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+    for table in Base.metadata.sorted_tables:
+        if session.execute(select(table).limit(1)).first() is not None:
+            raise RuntimeError("La base de laboratorio debe estar vacía")
     roles: dict[str, Role] = {}
     for code in ("ADMIN", "COORDINATOR", "MECHANIC"):
         role = session.scalar(select(Role).where(Role.code == code))
@@ -107,3 +116,17 @@ def seed_lab(session: Session) -> None:
                 Membership(user_id=user.id, branch_id=branch.id, role_id=roles[role_code].id)
             )
     session.commit()
+
+
+def main() -> None:
+    from app.core.config import get_settings
+    from app.db.session import SessionLocal
+
+    if os.environ.get("APP_ENV") != "lab" or get_settings().app_env != "lab":
+        raise RuntimeError("La inicialización solo se permite con APP_ENV=lab")
+    with SessionLocal() as session:
+        seed_lab(session)
+
+
+if __name__ == "__main__":
+    main()

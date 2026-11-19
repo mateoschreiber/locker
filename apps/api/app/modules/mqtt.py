@@ -3,6 +3,7 @@
 import json
 import logging
 from datetime import UTC, datetime
+from threading import Event
 from typing import Any
 from uuid import uuid4
 
@@ -36,17 +37,22 @@ class MqttBridge:
     def __init__(self) -> None:
         settings = get_settings()
         self.host, self.port = settings.mqtt_host, settings.mqtt_port
+        self.subscribed = Event()
+        self.subscription_mid: int | None = None
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
             client_id="locker-api",
         )
         self.client.on_connect, self.client.on_message = self._on_connect, self._on_message
+        self.client.on_subscribe = self._on_subscribe
+        self.client.on_disconnect = self._on_disconnect
 
     def start(self) -> None:
         self.client.connect_async(self.host, self.port, keepalive=30)
         self.client.loop_start()
 
     def stop(self) -> None:
+        self.subscribed.clear()
         self.client.loop_stop()
         self.client.disconnect()
 
@@ -66,9 +72,27 @@ class MqttBridge:
         properties: Any,
     ) -> None:
         del userdata, flags, properties
+        self.subscribed.clear()
         if not reason_code.is_failure:
-            client.subscribe("locker/+/events", qos=1)
+            result, self.subscription_mid = client.subscribe("locker/+/events", qos=1)
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                logger.error("mqtt_subscription_request_failed code=%s", result)
+
+    def _on_subscribe(
+        self, client: mqtt.Client, userdata: Any, mid: int, reasons: Any, properties: Any
+    ) -> None:
+        del client, userdata, properties
+        if mid == self.subscription_mid and reasons and not any(r.is_failure for r in reasons):
+            self.subscribed.set()
             logger.info("mqtt_events_subscribed")
+        else:
+            logger.error("mqtt_subscription_rejected mid=%s reasons=%s", mid, reasons)
+
+    def _on_disconnect(
+        self, client: mqtt.Client, userdata: Any, flags: Any, reason: Any, properties: Any
+    ) -> None:
+        del client, userdata, flags, reason, properties
+        self.subscribed.clear()
 
     def _on_message(self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
         del client, userdata

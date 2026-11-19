@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from threading import Event
 from typing import Any
 
 import paho.mqtt.client as mqtt
@@ -17,6 +18,7 @@ logger = logging.getLogger("locker_simulator")
 LOCKER_ID = os.getenv("LOCKER_ID", "LAB-LOCKER-001")
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+subscribed = Event()
 
 
 def publish_status(client: mqtt.Client, event_type: str) -> None:
@@ -36,10 +38,23 @@ def on_connect(
     properties: mqtt.Properties | None,
 ) -> None:
     del userdata, flags, properties
+    subscribed.clear()
     if reason_code.is_failure:
         logger.error("mqtt_connection_refused reason=%s", reason_code)
         return
-    client.subscribe(topic(LOCKER_ID, "commands"), qos=1)
+    result, _ = client.subscribe(topic(LOCKER_ID, "commands"), qos=1)
+    if result != mqtt.MQTT_ERR_SUCCESS:
+        logger.error("simulator_subscription_request_failed code=%s", result)
+
+
+def on_subscribe(
+    client: mqtt.Client, userdata: Any, mid: int, reasons: Any, properties: Any
+) -> None:
+    del userdata, mid, properties
+    if not reasons or any(reason.is_failure for reason in reasons):
+        logger.error("simulator_subscription_rejected reasons=%s", reasons)
+        return
+    subscribed.set()
     publish_status(client, "LOCKER_ONLINE")
     logger.info("simulator_online locker_id=%s", LOCKER_ID)
 
@@ -76,17 +91,28 @@ def main() -> None:
     while True:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"simulator-{LOCKER_ID}")
         client.on_connect = on_connect
+        client.on_subscribe = on_subscribe
         client.on_message = on_message
+        client.will_set(
+            topic(LOCKER_ID, "status"), envelope(LOCKER_ID, "LOCKER_OFFLINE", {"simulated": True}),
+            qos=1, retain=True,
+        )
         try:
             client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
             client.loop_start()
+            if not subscribed.wait(10):
+                logger.warning("simulator_subscription_timeout")
             while client.is_connected():
-                publish_status(client, "LOCKER_HEARTBEAT")
+                if subscribed.is_set():
+                    publish_status(client, "LOCKER_HEARTBEAT")
                 time.sleep(30)
             client.loop_stop()
         except OSError as error:
             logger.warning("mqtt_unavailable host=%s error=%s", MQTT_HOST, error)
         finally:
+            subscribed.clear()
+            if client.is_connected():
+                publish_status(client, "LOCKER_OFFLINE")
             client.disconnect()
         time.sleep(3)
 

@@ -1,0 +1,8 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml alembic.ini ./
+COPY app ./app
+COPY tests ./tests
+COPY integrity.sql ./integrity.sql
+RUN pip install '.[dev]'
+CMD ["sh", "-c", "alembic upgrade head && pytest -q"]

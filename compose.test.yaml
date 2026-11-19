@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: locker_test
+      POSTGRES_PASSWORD: isolated_test_only
+      POSTGRES_DB: locker_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locker_test -d locker_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    volumes:
+      - ./infra/docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/broker/version' -C 1 -W 3 >/dev/null"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+  simulator:
+    build: ./apps/locker-simulator
+    environment:
+      MQTT_HOST: mosquitto
+      LOCKER_ID: LAB-LOCKER-001
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+  api:
+    profiles: [restart]
+    build: ./apps/api
+    environment:
+      DATABASE_URL: postgresql+psycopg://locker_test:isolated_test_only@postgres:5432/locker_test
+      MQTT_HOST: mosquitto
+      APP_ENV: lab
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+  tests:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.test
+    environment:
+      DATABASE_URL: postgresql+psycopg://locker_test:isolated_test_only@postgres:5432/locker_test
+      MQTT_HOST: mosquitto
+      APP_ENV: lab
+      LOCKER_ISOLATED_TEST: '1'
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+      simulator:
+        condition: service_started
