@@ -51,6 +51,15 @@ Las pruebas de Fase 0 utilizan exclusivamente datos y servicios aislados. La ins
 
 En cada fase conservar contratos y datos funcionales, probar fallos y medir CPU, memoria, latencia y red antes de afirmar mejoras. Una futura PWA consumirá los mismos servicios; no forma parte de la fase 0.
 
+## Avance de Fase 1
+
+`apps/api-rust` contiene configuración, pool PostgreSQL y endpoints de salud con
+Axum/Tokio/SQLx; no implementa préstamos ni MQTT. El perfil Docker opcional usa
+un PostgreSQL distinto, temporal y sin migraciones ni seed. Python mantiene las
+operaciones simuladas. Se validaron conexión disponible e indisponible, parada
+ordenada y funcionamiento independiente del laboratorio. El acceso LAN desde
+otro equipo no se ha validado y permanece deshabilitado por defecto.
+
 ## Cierre de los tres hallazgos de Fase 0
 
 1. **Exposición del panel:** Compose publica `127.0.0.1:8083` por defecto. `LOCKER_BIND_ADDRESS` permite seleccionar explícitamente una dirección privada; la configuración efectiva se comprobó tanto con el valor predeterminado como con una dirección LAN de ejemplo. El acceso LAN requiere restringir la red y no convierte las credenciales de laboratorio en seguras.

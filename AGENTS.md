@@ -1,0 +1,8 @@
+# Reglas del proyecto
+
+- Trabajar siempre en `main`; no crear ramas nuevas ni hacer push automático.
+- Consultar el plan maestro cuando el trabajo afecte la migración.
+- Conservar el dominio de préstamos y custodia de herramientas y equipos y la compatibilidad funcional durante la migración.
+- Actualizar el README ante cambios de funcionalidades, configuración, requisitos o uso; documentar las variables de entorno nuevas.
+- Preferir soluciones simples y eficientes; ejecutar las pruebas relevantes y usar Docker cuando corresponda.
+- Mantener `admin:admin` exclusivamente en el laboratorio. No publicar en Internet ni conectar hardware real hasta resolver los riesgos conocidos.

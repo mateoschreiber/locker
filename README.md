@@ -2,7 +2,14 @@
 
 Laboratorio open source para un sistema de control, custodia y trazabilidad de
 herramientas mediante lockers electrónicos. Esta primera versión no controla
-hardware físico: usa PostgreSQL, FastAPI, React, MQTT y un simulador.
+hardware físico: usa PostgreSQL, FastAPI, React, MQTT y un simulador. La Fase 1
+agrega un backend Rust experimental e independiente con Axum, Tokio y SQLx.
+
+## Requisitos
+
+- Docker Desktop o Docker Engine con Compose y acceso a las imágenes necesarias.
+- Puerto TCP 8083 libre para el panel local. El perfil Rust opcional usa 18001.
+- Rust estable con `rustfmt` y `clippy` solo para compilar y probar fuera de Docker.
 
 ## Inicio rápido
 
@@ -28,6 +35,15 @@ Para detener el laboratorio sin borrar datos:
 docker compose down
 ```
 
+Para iniciar nuevamente, reconstruir o consultar registros:
+
+```bash
+docker compose up -d
+docker compose up -d --build
+docker compose ps
+docker compose logs -f api
+```
+
 Los servicios de PostgreSQL y MQTT están aislados dentro de Docker; no se
 publican en el host. Los valores de `.env.example` son exclusivamente de
 laboratorio y no deben utilizarse en producción.
@@ -35,6 +51,35 @@ laboratorio y no deben utilizarse en producción.
 El panel escucha solo en el propio equipo. Para una LAN privada se puede fijar
 `LOCKER_BIND_ADDRESS` a la dirección privada concreta antes de iniciar Compose;
 controle el acceso con el firewall. Las credenciales de laboratorio no son seguras.
+En Windows se puede obtener la IPv4 de la interfaz activa con `ipconfig`. La
+URL LAN sería `http://<IPv4-privada>:8083` tras configurar el bind y firewall;
+no se ha validado desde otro dispositivo. No usar `0.0.0.0`, exponer a Internet
+ni conectar equipos físicos mientras los riesgos de seguridad sigan abiertos.
+
+## Backend Rust opcional
+
+```bash
+docker compose --profile rust up -d --build api-rust
+docker compose --profile rust logs -f api-rust
+docker compose --profile rust stop api-rust rust-postgres
+```
+
+`http://127.0.0.1:18001/health/live` comprueba el proceso y
+`http://127.0.0.1:18001/health/ready` consulta PostgreSQL (`503` si no responde).
+Este perfil usa una instancia PostgreSQL **separada y temporal** en memoria:
+sus datos se pierden al detenerla. No accede a la base del laboratorio, no usa
+MQTT, no hace seed ni ejecuta migraciones. Python sigue atendiendo todas las
+operaciones; Rust todavía no implementa préstamos ni el panel.
+
+Variables Rust: `RUST_DATABASE_URL` es la conexión PostgreSQL obligatoria;
+`RUST_BIND_ADDRESS` es el socket interno y por defecto `0.0.0.0:8001`;
+`RUST_DB_MAX_CONNECTIONS` limita el pool (predeterminado `5`);
+`RUST_DB_TIMEOUT_SECONDS` limita adquisición y consulta de salud (predeterminado
+`3`); `RUST_LOG` controla el filtro de logs estructurados (Compose usa `info`).
+Compose fija `RUST_DATABASE_URL` a la base temporal aislada y permite configurar
+los límites y `RUST_LOG` en `.env`. No incluir credenciales reales en el repositorio.
+`LOCKER_TEST_DATABASE_URL` apunta a una base aislada para la prueba de integración
+Rust y solo se necesita al ejecutar esa prueba.
 
 Las pruebas de integración crean PostgreSQL y MQTT aislados, sin publicar puertos
 ni usar los volúmenes del laboratorio:
@@ -78,7 +123,13 @@ Ejecute las validaciones desde cada aplicación:
 cd apps/api && pip install -e '.[dev]' && ruff check . && mypy app && pytest
 cd apps/web && npm ci && npm run lint && npm run build && npm test
 cd apps/locker-simulator && pip install -e '.[dev]' && ruff check . && pytest
+cd apps/api-rust && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --release --locked
 ```
+
+La prueba Rust con PostgreSQL se ejecuta explícitamente con
+`LOCKER_TEST_DATABASE_URL` apuntando a una base aislada y
+`cargo test --locked -- --ignored`. CI proporciona esa base; sin ella la prueba
+aparece como ignorada, no como validación de conexión.
 
 Consulte [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar cambios y
 [SECURITY.md](SECURITY.md) para reportes de seguridad.
