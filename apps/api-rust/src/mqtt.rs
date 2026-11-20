@@ -27,8 +27,10 @@ use uuid::Uuid;
 
 use crate::audit::{admin_actor, audit};
 use crate::config::MqttSettings;
+use crate::presence::{self, PresenceStore};
 
 const EVENTS_FILTER: &str = "locker/+/events";
+const STATUS_FILTER: &str = "locker/+/status";
 const POLL: Duration = Duration::from_millis(250);
 /// A claimed operation whose PUBACK never arrives is indeterminable and
 /// becomes UNKNOWN; shortcut: fixed 10s window, no environment knob needed.
@@ -53,11 +55,22 @@ struct CompartmentEvent {
 
 /// Starts the bridge background task. `subscribed` reflects the events
 /// subscription and gates `/health/ready`, mirroring the Python bridge.
-pub fn start(pool: PgPool, settings: MqttSettings, subscribed: Arc<AtomicBool>) -> JoinHandle<()> {
-    tokio::spawn(run_bridge(pool, settings, subscribed))
+/// `presence` collects `locker/+/status` samples for the presence API.
+pub fn start(
+    pool: PgPool,
+    settings: MqttSettings,
+    subscribed: Arc<AtomicBool>,
+    presence: PresenceStore,
+) -> JoinHandle<()> {
+    tokio::spawn(run_bridge(pool, settings, subscribed, presence))
 }
 
-async fn run_bridge(pool: PgPool, settings: MqttSettings, subscribed: Arc<AtomicBool>) {
+async fn run_bridge(
+    pool: PgPool,
+    settings: MqttSettings,
+    subscribed: Arc<AtomicBool>,
+    presence: PresenceStore,
+) {
     // Startup recovery: rows left in PUBLISHING by a previous process never
     // recorded their PUBACK — delivery is indeterminable, so they become
     // UNKNOWN and are never republished (no repeated physical opens). The
@@ -84,8 +97,16 @@ async fn run_bridge(pool: PgPool, settings: MqttSettings, subscribed: Arc<Atomic
             let polled = tokio::time::timeout(POLL, eventloop.poll()).await;
             match polled {
                 Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
-                    subscribed.store(true, Ordering::Relaxed);
-                    tracing::info!("mqtt_events_subscribed");
+                    // Readiness belongs to the events subscription alone: the
+                    // status subscription is only requested after the events
+                    // SUBACK, so it can never satisfy readiness on its own.
+                    if !subscribed.swap(true, Ordering::Relaxed) {
+                        tracing::info!("mqtt_events_subscribed");
+                        if let Err(error) = client.subscribe(STATUS_FILTER, QoS::AtLeastOnce).await
+                        {
+                            tracing::warn!(?error, "mqtt_status_subscribe_request_failed");
+                        }
+                    }
                 }
                 Ok(Ok(Event::Incoming(Packet::PubAck(_)))) => {
                     // Late PUBACK after an out-of-order event: conditional
@@ -97,7 +118,14 @@ async fn run_bridge(pool: PgPool, settings: MqttSettings, subscribed: Arc<Atomic
                     }
                 }
                 Ok(Ok(Event::Incoming(Packet::Publish(published)))) => {
-                    if let Err(error) = handle_publish(&pool, published.payload.to_vec()).await {
+                    if let Err(error) = handle_publish(
+                        &pool,
+                        &presence,
+                        published.topic.clone(),
+                        published.payload.to_vec(),
+                    )
+                    .await
+                    {
                         tracing::error!(?error, "mqtt_handle_event_failed");
                     }
                 }
@@ -332,7 +360,18 @@ pub async fn expire_published(pool: &PgPool, ttl: Duration) -> Result<u64, sqlx:
     Ok(result.rows_affected())
 }
 
-async fn handle_publish(pool: &PgPool, payload: Vec<u8>) -> Result<(), sqlx::Error> {
+/// Dispatches one incoming publish: status samples feed the presence map
+/// (synchronous, no database); event payloads run the confirmation flow.
+async fn handle_publish(
+    pool: &PgPool,
+    presence: &PresenceStore,
+    topic: String,
+    payload: Vec<u8>,
+) -> Result<(), sqlx::Error> {
+    if topic.ends_with("/status") {
+        presence::record(presence, &topic, &payload);
+        return Ok(());
+    }
     let event: CompartmentEvent = match serde_json::from_slice(&payload) {
         Ok(event) => event,
         Err(_) => {

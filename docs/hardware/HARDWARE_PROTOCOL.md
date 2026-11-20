@@ -96,3 +96,33 @@ Reglas:
 
 Si no existe información suficiente, la operación permanece `UNKNOWN` con sus
 recursos bloqueados y debe reportarse para conciliación operativa.
+
+## Presencia observada (F4.1-A)
+
+El puente Rust también consume `locker/+/status` (misma conexión, suscrita
+solo tras el SUBACK de `locker/+/events`, de modo que el readiness sigue
+exigiendo la suscripción de eventos). La presencia es estado observacional en
+memoria del proceso Rust — sin escrituras a PostgreSQL — y se recupera tras un
+reinicio del backend mediante el replay de mensajes retained del broker,
+revalidando su timestamp.
+
+Estados expuestos por `GET /api/v1/lockers/presence` (solo Rust):
+
+- `ONLINE`: último mensaje válido con antigüedad ≤ umbral (90 s por defecto,
+  `RUST_PRESENCE_STALE_SECONDS`, 30–600).
+- `STALE`: existe evidencia pero vencida; **un retained antiguo nunca se
+  presenta como conectado**.
+- `OFFLINE`: `LOCKER_OFFLINE` (Last Will o explícito), persistente hasta
+  nueva evidencia.
+- `UNKNOWN`: sin información confiable, o código de locker duplicado entre
+  sucursales (`ambiguous_code: true`) — la presencia no se atribuye al
+  dispositivo equivocado (hallazgo #9).
+
+Reglas: mensajes malformados, tipos desconocidos y timestamps futuros (más de
+30 s de skew) se ignoran; códigos inexistentes no se listan; los heartbeats no
+generan auditoría (evita crecimiento ilimitado de `audit_events`).
+
+`GET /api/v1/capabilities` (solo Rust) declara `{resolve, presence}`: el panel
+habilita conciliación y presencia únicamente cuando el backend conectado las
+anuncia — el backend Python responde 404 y el panel nunca le envía esas
+solicitudes.

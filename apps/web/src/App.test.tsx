@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, expect, test, vi } from 'vitest'
 import { App } from './App'
 
-type Item = Record<string, string | number | null | undefined>
+type Item = Record<string, string | number | boolean | null | undefined>
 type Data = Record<string, Item[]>
 
 function fixture(): Data {
@@ -35,8 +35,14 @@ function jsonResponse(body: unknown, ok = true) {
 type Mutation = () => { ok: boolean; body: unknown }
 
 /** Stub of the API: entity lists from `data`, deferred URLs answered by the
- * test (honoring AbortSignal like a real fetch). */
-function stubApi(data: Data, options?: { deferred?: string[]; mutation?: Mutation }) {
+ * test (honoring AbortSignal like a real fetch). `capabilities` emulates the
+ * Rust backend feature detection (absent → 404 like the Python backend). */
+function stubApi(data: Data, options?: {
+  deferred?: string[]
+  mutation?: Mutation
+  capabilities?: Record<string, boolean>
+  presence?: Item[]
+}) {
   const calls: { url: string; init?: RequestInit }[] = []
   const resolvers = new Map<string, (value: unknown) => void>()
   vi.stubGlobal(
@@ -56,6 +62,11 @@ function stubApi(data: Data, options?: { deferred?: string[]; mutation?: Mutatio
             { id: 'a1', action: 'LOGIN', entity_type: 'User', entity_id: 'u1', created_at: '2026-01-01T00:00:00Z' },
           ],
         })
+      if (url === '/api/v1/capabilities') {
+        if (options?.capabilities) return jsonResponse(options.capabilities)
+        return jsonResponse({ detail: 'Not Found' }, false)
+      }
+      if (url === '/api/v1/lockers/presence') return jsonResponse(options?.presence ?? [])
       if (options?.deferred?.includes(url)) {
         return new Promise((resolve, reject) => {
           resolvers.set(url, (value: unknown) => resolve(jsonResponse(value)))
@@ -77,7 +88,12 @@ function stubApi(data: Data, options?: { deferred?: string[]; mutation?: Mutatio
   return { calls, resolvers }
 }
 
-async function enterPanel(data: Data, options?: { deferred?: string[]; mutation?: Mutation }) {
+async function enterPanel(data: Data, options?: {
+  deferred?: string[]
+  mutation?: Mutation
+  capabilities?: Record<string, boolean>
+  presence?: Item[]
+}) {
   const api = stubApi(data, options)
   render(<App />)
   const form = screen.getByRole('button', { name: 'Ingresar al panel' }).closest('form')!
@@ -164,4 +180,71 @@ test('los errores del backend se muestran al usuario', async () => {
   await waitFor(() =>
     expect(screen.getByText('La herramienta tiene un préstamo activo o pendiente')).toBeTruthy(),
   )
+})
+
+// ---------------------------------------------------------------------------
+// F4.1-A: observed presence and the capabilities gate.
+// ---------------------------------------------------------------------------
+
+const presenceRows = (over: Partial<Item> = {}): Item[] => [
+  {
+    locker_id: 'k1', code: 'LAB-LOCKER-001', name: 'Locker principal', administrative_status: 'ONLINE',
+    presence: 'ONLINE', last_communication: '2026-01-01T00:00:00Z', age_seconds: 5,
+    source: 'locker/LAB-LOCKER-001/status', ambiguous_code: false, updated_at: '2026-01-01T00:00:00Z',
+    ...over, id: 'p1',
+  },
+  {
+    locker_id: 'k2', code: 'LAB-LOCKER-002', name: 'Locker taller', administrative_status: 'ONLINE',
+    presence: 'OFFLINE', last_communication: '2026-01-01T00:00:00Z', age_seconds: 5,
+    source: 'locker/LAB-LOCKER-002/status', ambiguous_code: false, updated_at: '2026-01-01T00:00:00Z',
+  },
+]
+
+test('la presencia observada se muestra solo cuando el backend la soporta', async () => {
+  const data = fixture()
+  data.lockers = [
+    { id: 'k1', code: 'LAB-LOCKER-001', name: 'Locker principal', status: 'ONLINE' },
+    { id: 'k2', code: 'LAB-LOCKER-002', name: 'Locker taller', status: 'ONLINE' },
+  ]
+  await enterPanel(data, { capabilities: { resolve: true, presence: true }, presence: presenceRows() })
+  fireEvent.click(screen.getByRole('button', { name: /Lockers/ }))
+
+  // Estado administrativo y presencia observada conviven por fila.
+  const online = within(screen.getByText('LAB-LOCKER-001').closest('tr')!)
+  expect(online.getAllByText('ONLINE').length).toBe(2)
+  const offline = within(screen.getByText('LAB-LOCKER-002').closest('tr')!)
+  expect(offline.getByText('OFFLINE')).toBeTruthy()
+
+  // El detalle muestra la última comunicación observada.
+  fireEvent.click(screen.getByText('LAB-LOCKER-002'))
+  await waitFor(() => expect(screen.getByText(/Presencia observada/).textContent).toContain('OFFLINE'))
+  expect(screen.getByText(/Presencia observada/).textContent).toContain('última comunicación')
+})
+
+test('el backend sin capacidad de presencia no recibe la solicitud', async () => {
+  const data = fixture()
+  data.lockers = [{ id: 'k1', code: 'LAB-LOCKER-001', name: 'Locker principal', status: 'ONLINE' }]
+  const api = await enterPanel(data) // sin capabilities: como el backend Python
+  fireEvent.click(screen.getByRole('button', { name: /Lockers/ }))
+  expect(screen.queryByText('presence')).toBeNull()
+  expect(screen.queryByText('last communication')).toBeNull()
+  expect(api.calls.every(({ url }) => !url.includes('lockers/presence'))).toBe(true)
+})
+
+test('el dashboard no muestra todo listo mientras exista una intervención', async () => {
+  const data = fixture()
+  data.operations = [{
+    id: 'op1', status: 'FAILED', command_type: 'RETURN', tool_id: 't1', loan_id: 'l1',
+    correlation_id: 'c1', origin: 'rust', created_at: '2026-01-01T00:00:00Z',
+    failure_reason: 'Compartment is occupied',
+  }]
+  data.loans = [{ id: 'l1', status: 'RETURN_PENDING', tool_id: 't1', user_id: 'u1' }]
+  await enterPanel(data, { capabilities: { resolve: true, presence: true }, presence: presenceRows() })
+  expect(screen.getByText('Atención requerida')).toBeTruthy()
+
+  // Sin condiciones pendientes, el estado vuelve a estar listo.
+  const clean = fixture()
+  clean.lockers = [{ id: 'k1', code: 'LAB-LOCKER-001', name: 'Locker principal', status: 'ONLINE' }]
+  await enterPanel(clean, { capabilities: { resolve: true, presence: true }, presence: presenceRows().slice(0, 1) })
+  expect(screen.getByText('Todo listo para operar')).toBeTruthy()
 })

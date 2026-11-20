@@ -183,6 +183,26 @@ actividad. El acceso de laboratorio es `admin` / `admin`.
   estados en curso (`PENDING`, `PUBLISHING`, `PUBLISHED`, `UNKNOWN`); una
   colocación nueva en ese compartimento responde `409`.
 
+## Supervisión y presencia (Fase 4.1)
+
+El backend Rust expone dos contratos adicionales que Python no implementa;
+`GET /api/v1/capabilities` los declara y el panel solo habilita esas
+funciones cuando el backend conectado los anuncia:
+
+- `GET /api/v1/lockers/presence`: presencia observada por locker mediante
+  MQTT (`LOCKER_ONLINE`/`LOCKER_HEARTBEAT`/`LOCKER_OFFLINE` en
+  `locker/{code}/status`). Estados: `ONLINE` (comunicación reciente y
+  válida), `STALE` (evidencia vencida — un mensaje retained antiguo nunca se
+  presenta como conectado), `OFFLINE` (desconexión conocida, incluido el
+  Last Will) y `UNKNOWN` (sin información confiable o código duplicado entre
+  sucursales, `ambiguous_code`). Incluye `last_communication`,
+  `age_seconds`, `source` y `updated_at` cuando existen. La presencia vive en
+  memoria del proceso y se recupera tras reinicios por el replay retained del
+  broker, revalidando timestamps; los heartbeats no generan auditoría.
+- `RUST_PRESENCE_STALE_SECONDS` (predeterminado `90`, rango `30`–`600`)
+  fija la ventana a partir de la cual la comunicación se considera `STALE`;
+  configurable en `.env` para el perfil `rust`.
+
 ## Desarrollo
 
 Ejecute las validaciones desde cada aplicación:

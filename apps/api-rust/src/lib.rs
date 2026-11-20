@@ -11,6 +11,7 @@ mod inventory;
 mod json;
 pub mod mqtt;
 mod operations;
+mod presence;
 
 use axum::{
     extract::{Path, Query, State},
@@ -22,10 +23,17 @@ use std::sync::atomic::AtomicBool;
 use std::{sync::Arc, time::Duration};
 
 pub use config::{MqttSettings, Settings};
+pub use presence::{new_store, PresenceStore};
 
 /// Full application router: health at the root, the migrated domain under `/api/v1`.
-/// `mqtt_ready` gates `/health/ready` on the MQTT events subscription.
-pub fn router(pool: PgPool, timeout: Duration, mqtt_ready: Option<Arc<AtomicBool>>) -> Router {
+/// `mqtt_ready` gates `/health/ready` on the MQTT events subscription;
+/// `presence` serves the observed locker presence (F4.1-A).
+pub fn router(
+    pool: PgPool,
+    timeout: Duration,
+    mqtt_ready: Option<Arc<AtomicBool>>,
+    presence: PresenceStore,
+) -> Router {
     let mut api = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/me", get(auth::me))
@@ -59,7 +67,12 @@ pub fn router(pool: PgPool, timeout: Duration, mqtt_ready: Option<Arc<AtomicBool
             post(operations::resolve_operation),
         )
         .route("/audit", get(dashboard::list_audit))
-        .route("/dashboard", get(dashboard::dashboard));
+        .route("/dashboard", get(dashboard::dashboard))
+        .route("/capabilities", get(presence::capabilities));
+    // Presence needs (pool, store) state of its own; merged after with_state.
+    let presence_api = Router::new()
+        .route("/lockers/presence", get(presence::lockers_presence))
+        .with_state((pool.clone(), presence));
     for spec in entities::ADMIN {
         let path = format!("/{}", spec.path);
         let entity = Router::new()
@@ -94,5 +107,6 @@ pub fn router(pool: PgPool, timeout: Duration, mqtt_ready: Option<Arc<AtomicBool
             );
         api = api.nest(path.as_str(), entity);
     }
-    health::router(pool.clone(), timeout, mqtt_ready).nest("/api/v1", api.with_state(pool))
+    health::router(pool.clone(), timeout, mqtt_ready)
+        .nest("/api/v1", api.with_state(pool).merge(presence_api))
 }

@@ -385,7 +385,49 @@ paginación #13 (F4.1/F4.2); esquemas sin uso #18 (se retiran con Python).
 No se realizó el cutover: Python sigue conectado al laboratorio y Rust
 permanece aislado.
 
+## Avance de Fase 4.1 — A: presencia observada (MQTT)
+
+- El puente Rust consume `locker/+/status` en la misma conexión, suscrita
+  **solo tras** el SUBACK de `locker/+/events`: el readiness sigue exigiendo
+  la suscripción de eventos y una suscripción de status jamás la satisface.
+- La presencia es estado observacional **en memoria** (sin migración ni
+  escrituras): se recupera de reinicios del backend por el replay de mensajes
+  retained del broker, revalidando timestamps; un retained antiguo nunca
+  presenta un locker como conectado.
+- Estados derivados en lectura (sin barridos): `ONLINE` (comunicación
+  reciente y válida), `OFFLINE` (Last Will o mensaje explícito, persistente
+  hasta nueva evidencia), `STALE` (evidencia vencida;
+  `RUST_PRESENCE_STALE_SECONDS`, 90 s por defecto, 30–600) y `UNKNOWN` (sin
+  datos o código duplicado entre sucursales, `ambiguous_code: true`: la
+  presencia no se atribuye al dispositivo equivocado, hallazgo #9).
+  Mensajes malformados, tipos desconocidos y timestamps futuros (>30 s de
+  skew) se ignoran; los heartbeats no generan auditoría.
+- Contratos nuevos solo-Rust, declarados por `GET /api/v1/capabilities`:
+  `GET /api/v1/lockers/presence` (identificador, código, nombre, estado
+  administrativo, presencia, última comunicación, antigüedad, origen y
+  actualización; sin datos no inventa disponibilidad) y el propio
+  `capabilities`. Python responde 404: el panel no envía esas solicitudes al
+  backend activo del laboratorio.
+- Panel: vista Lockers con badge de presencia y última comunicación
+  (columnas solo presentes con datos), detalle con presencia observada y
+  aviso de código duplicado; el dashboard deja de afirmar "Todo listo para
+  operar" mientras exista una operación por conciliar o un locker
+  administrativamente activo sin presencia confirmada.
+
+Validación local ejecutada (20-11-2026): `cargo fmt --check`,
+`clippy --locked --all-targets -- -D warnings`, unitarias **8/8** (2 nuevas de
+presencia: ingest y derivación de estados) e integración aislada con
+PostgreSQL y Mosquitto **27/27** (nueva `presence_lifecycle_and_recovery_over_broker`:
+sin datos → UNKNOWN, retained antiguo → STALE, heartbeat fresco → ONLINE con
+antigüedad y origen, OFFLINE persistente, mensaje malformado ignorado,
+código duplicado no atribuido, código inexistente no listado y reinicio del
+backend con store nuevo recuperando por replay retained). Lint, build y
+pruebas web (7 de componentes: presencia por locker con y sin capacidades,
+dashboard con intervención pendiente). La paridad no cambia sus contratos
+compartidos; la validación completa de F4.1 se ejecuta al cierre del bloque C.
+
 ## Cierre de los tres hallazgos de Fase 0
+
 
 
 1. **Exposición del panel:** Compose publica `127.0.0.1:8083` por defecto. `LOCKER_BIND_ADDRESS` permite seleccionar explícitamente una dirección privada; la configuración efectiva se comprobó tanto con el valor predeterminado como con una dirección LAN de ejemplo. El acceso LAN requiere restringir la red y no convierte las credenciales de laboratorio en seguras.

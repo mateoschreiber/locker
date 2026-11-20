@@ -7,7 +7,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use locker_api_rust::router;
+use locker_api_rust::{new_store, router};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, query, query_scalar, PgPool};
 use std::time::Duration;
@@ -30,7 +30,12 @@ struct Lab {
     tool2: Uuid,
 }
 
-async fn setup() -> (PgPool, Router, tokio::sync::MutexGuard<'static, ()>) {
+async fn setup() -> (
+    PgPool,
+    Router,
+    locker_api_rust::PresenceStore,
+    tokio::sync::MutexGuard<'static, ()>,
+) {
     // The guard serializes the whole test body: one shared test database.
     let guard = LOCK.lock().await;
     let url = std::env::var("LOCKER_TEST_DATABASE_URL").expect("LOCKER_TEST_DATABASE_URL required");
@@ -44,9 +49,11 @@ async fn setup() -> (PgPool, Router, tokio::sync::MutexGuard<'static, ()>) {
         .execute(&pool)
         .await
         .expect("recreate schema");
+    let presence = new_store(Duration::from_secs(90));
     (
         pool.clone(),
-        router(pool, Duration::from_secs(5), None),
+        router(pool, Duration::from_secs(5), None, presence.clone()),
+        presence,
         guard,
     )
 }
@@ -180,7 +187,7 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn routes_smoke_and_login() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     for path in [
         "/api/v1/branches",
         "/api/v1/roles",
@@ -268,7 +275,7 @@ async fn routes_smoke_and_login() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn admin_crud_validates_contracts() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     seed(&pool).await;
 
     let (status, value) = post(
@@ -421,7 +428,7 @@ async fn lab_user(pool: &PgPool) -> Uuid {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn placements_validate_hierarchy_and_occupancy() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
 
     // Wrong hierarchy: compartment belongs to locker2 but payload claims locker.
@@ -508,7 +515,7 @@ async fn placements_validate_hierarchy_and_occupancy() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn authorization_transitions_and_idempotent_checkout() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -622,7 +629,7 @@ async fn authorization_transitions_and_idempotent_checkout() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn concurrent_returns_to_one_compartment_create_a_single_operation() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // Two active loans whose tools both came out of the same compartment.
     let tool3 = Uuid::new_v4();
@@ -686,7 +693,7 @@ async fn concurrent_returns_to_one_compartment_create_a_single_operation() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn concurrent_checkouts_create_a_single_loan() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -725,7 +732,7 @@ async fn concurrent_checkouts_create_a_single_loan() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn return_requires_active_loan_and_free_compartment() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // Simulate a post-checkout state: active loan, origin placement already removed.
     let loan = Uuid::new_v4();
@@ -808,7 +815,7 @@ async fn return_requires_active_loan_and_free_compartment() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn dashboard_counts_reflect_database() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
     query("UPDATE tools SET status = 'ON_LOAN' WHERE id = $1")
@@ -867,6 +874,7 @@ fn mqtt_settings() -> MqttSettings {
             .expect("valid LOCKER_TEST_MQTT_PORT"),
         client_id: format!("test-bridge-{}", Uuid::new_v4().simple()),
         confirm_timeout: Duration::from_secs(60),
+        stale_seconds: 90,
     }
 }
 
@@ -990,7 +998,7 @@ async fn force_published_stale(pool: &PgPool, correlation_id: &str) {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn mqtt_checkout_and_return_confirm_via_broker() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // locker2 has the globally-unique code "L2"; "L1" exists in two branches
     // and the #9 publish-time check would refuse it.
@@ -999,7 +1007,12 @@ async fn mqtt_checkout_and_return_confirm_via_broker() {
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag.clone());
+    let bridge = mqtt::start(
+        pool.clone(),
+        settings.clone(),
+        flag.clone(),
+        _presence.clone(),
+    );
 
     // CHECKOUT: HTTP -> claim -> publish -> event -> confirm.
     let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
@@ -1084,14 +1097,14 @@ async fn mqtt_checkout_and_return_confirm_via_broker() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn duplicate_opened_event_has_no_double_effect() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
 
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
     action(
@@ -1129,7 +1142,7 @@ async fn duplicate_opened_event_has_no_double_effect() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn event_before_puback_confirms_and_late_puback_never_overwrites() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -1179,7 +1192,7 @@ async fn event_before_puback_confirms_and_late_puback_never_overwrites() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn late_event_confirms_unknown_after_ttl() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -1240,7 +1253,7 @@ async fn late_event_confirms_unknown_after_ttl() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn restart_publishes_pending_and_marks_orphan_publishing_unknown() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // Globally-unique locker code so the #9 check does not refuse the flows.
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
@@ -1279,7 +1292,7 @@ async fn restart_publishes_pending_and_marks_orphan_publishing_unknown() {
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     // Restart behavior: A is published once (and completes), B is UNKNOWN and
     // is NEVER republished (no uncertain second physical open).
@@ -1310,7 +1323,7 @@ async fn restart_publishes_pending_and_marks_orphan_publishing_unknown() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn python_origin_operations_are_never_claimed_by_rust() {
-    let (pool, _app, _guard) = setup().await;
+    let (pool, _app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
 
     // A PENDING operation the Python API created on a shared database.
@@ -1342,7 +1355,7 @@ async fn python_origin_operations_are_never_claimed_by_rust() {
     let settings = mqtt_settings();
     let (_simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let status: String =
@@ -1373,7 +1386,7 @@ async fn python_origin_operations_are_never_claimed_by_rust() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn ambiguous_locker_code_fails_without_publishing() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // lab.locker and lab.locker3 share code "L1" across branches (audit #9).
     place(&pool, lab.tool2, lab.branch2, lab.locker3, lab.compartment3).await;
@@ -1381,7 +1394,7 @@ async fn ambiguous_locker_code_fails_without_publishing() {
     let settings = mqtt_settings();
     let (_simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     let authorization = create_authorization(&app, lab.tool2, lab.admin, lab.branch2).await;
     action(
@@ -1411,7 +1424,7 @@ async fn ambiguous_locker_code_fails_without_publishing() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn resolve_endpoint_guards_reverts_and_survives_late_events() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -1584,7 +1597,7 @@ async fn resolve_endpoint_guards_reverts_and_survives_late_events() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn resolve_confirmed_attests_physical_execution() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -1665,7 +1678,7 @@ async fn resolve_confirmed_attests_physical_execution() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn resolve_confirmed_that_cannot_apply_fails_and_releases_the_loan() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
 
@@ -1755,9 +1768,14 @@ async fn resolve_confirmed_that_cannot_apply_fails_and_releases_the_loan() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn readiness_gates_on_mqtt_subscription_flag() {
-    let (pool, _app, _guard) = setup().await;
+    let (pool, _app, _presence, _guard) = setup().await;
     let flag = Arc::new(AtomicBool::new(false));
-    let app = router(pool.clone(), Duration::from_secs(5), Some(flag.clone()));
+    let app = router(
+        pool.clone(),
+        Duration::from_secs(5),
+        Some(flag.clone()),
+        _presence.clone(),
+    );
     let response = app
         .clone()
         .oneshot(
@@ -1821,7 +1839,7 @@ async fn status_of(pool: &PgPool, sql: &str, id: Uuid) -> String {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn manual_status_contract_and_domain_guards() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
 
@@ -2003,7 +2021,7 @@ async fn manual_status_contract_and_domain_guards() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn publish_failure_reverts_loan_and_authorization() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // locker "L1" exists in two branches: the #9 publish-time check refuses
     // it. The command never reaches the broker, so the failure is known NOT
@@ -2013,7 +2031,7 @@ async fn publish_failure_reverts_loan_and_authorization() {
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
     action(
@@ -2100,14 +2118,14 @@ async fn publish_failure_reverts_loan_and_authorization() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn return_event_with_occupied_compartment_keeps_loan_and_resolves() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
 
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     // Complete checkout over the broker so the tool is on the person.
     let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
@@ -2227,14 +2245,14 @@ async fn return_event_with_occupied_compartment_keeps_loan_and_resolves() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
 async fn checkout_event_without_placement_fails_and_releases_via_resolve() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
 
     let settings = mqtt_settings();
     let (simulator, mut commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag, _presence.clone());
 
     let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
     action(
@@ -2308,7 +2326,7 @@ async fn checkout_event_without_placement_fails_and_releases_via_resolve() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn mismatched_event_fails_without_touching_the_domain() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
 
@@ -2367,7 +2385,7 @@ async fn mismatched_event_fails_without_touching_the_domain() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn placement_reservation_covers_every_pending_return_state() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
 
     let placement_json = json!({
@@ -2505,7 +2523,7 @@ async fn placement_reservation_covers_every_pending_return_state() {
 #[tokio::test]
 #[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
 async fn concurrent_placement_and_return_into_the_same_compartment_serialize() {
-    let (pool, app, _guard) = setup().await;
+    let (pool, app, _presence, _guard) = setup().await;
     let lab = seed(&pool).await;
     // tool is OUT (loan ACTIVE) and compartment3 is free: a placement and a
     // return race for it. One must win; the loser gets a 409 explaining why.
@@ -2579,4 +2597,151 @@ async fn concurrent_placement_and_return_into_the_same_compartment_serialize() {
         .unwrap();
         assert_eq!(reserved, 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// F4.1-A: observed presence from `locker/+/status` — unknown without data,
+// retained old messages never fake ONLINE, OFFLINE is sticky, ambiguous
+// codes are never attributed, and a fresh store recovers via retained replay.
+// ---------------------------------------------------------------------------
+
+async fn publish_status(
+    client: &AsyncClient,
+    code: &str,
+    kind: &str,
+    timestamp: &str,
+    retain: bool,
+) {
+    let envelope = json!({
+        "message_id": Uuid::new_v4().to_string(),
+        "correlation_id": null,
+        "protocol_version": "1.0",
+        "locker_id": code,
+        "compartment_id": null,
+        "timestamp": timestamp,
+        "type": kind,
+        "payload": {"simulated": true},
+    });
+    client
+        .publish(
+            format!("locker/{code}/status"),
+            QoS::AtLeastOnce,
+            retain,
+            envelope.to_string(),
+        )
+        .await
+        .expect("publish status");
+}
+
+fn iso_seconds_ago(seconds: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339()
+}
+
+async fn wait_for_presence(app: &Router, code: &str, wanted: &str) -> Value {
+    for _ in 0..150 {
+        let (status, value) = get(app, "/api/v1/lockers/presence").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let Some(row) = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["code"] == code)
+        else {
+            panic!("locker {code} missing from presence: {value}");
+        };
+        if row["presence"] == wanted {
+            return row.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("presence of {code} never reached {wanted}");
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
+async fn presence_lifecycle_and_recovery_over_broker() {
+    let (pool, app, presence, _guard) = setup().await;
+    let _lab = seed(&pool).await;
+    let settings = mqtt_settings();
+    let (simulator, _commands) = start_simulator(&settings).await;
+    let flag = Arc::new(AtomicBool::new(false));
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag.clone(), presence.clone());
+
+    // No data yet: every locker reads UNKNOWN with no invented values.
+    let (_, value) = get(&app, "/api/v1/lockers/presence").await;
+    assert!(
+        value.as_array().unwrap().iter().all(|row| row["presence"] == "UNKNOWN"),
+        "{value}"
+    );
+    let row = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["code"] == "L2")
+        .unwrap();
+    assert!(row["last_communication"].is_null() && row["age_seconds"].is_null(), "{row}");
+
+    // An old retained ONLINE is stored but never reads as connected (#15).
+    publish_status(&simulator, "L2", "LOCKER_ONLINE", &iso_seconds_ago(3600), true).await;
+    let row = wait_for_presence(&app, "L2", "STALE").await;
+    assert!(row["last_communication"].is_string(), "{row}");
+
+    // A fresh heartbeat restores ONLINE with age and source.
+    publish_status(&simulator, "L2", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    let row = wait_for_presence(&app, "L2", "ONLINE").await;
+    assert!(row["age_seconds"].as_i64().unwrap() < 90, "{row}");
+    assert_eq!(row["source"], "locker/L2/status", "{row}");
+
+    // A known disconnect is sticky until new evidence arrives.
+    publish_status(&simulator, "L2", "LOCKER_OFFLINE", &iso_seconds_ago(1), true).await;
+    wait_for_presence(&app, "L2", "OFFLINE").await;
+
+    // Malformed evidence changes nothing.
+    simulator
+        .publish("locker/L2/status", QoS::AtLeastOnce, false, "not json".to_string())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_presence(&app, "L2", "OFFLINE").await;
+
+    // "L1" exists in two branches: presence is never attributed (#9).
+    publish_status(&simulator, "L1", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, value) = get(&app, "/api/v1/lockers/presence").await;
+    for row in value.as_array().unwrap().iter().filter(|row| row["code"] == "L1") {
+        assert_eq!(row["presence"], "UNKNOWN", "{row}");
+        assert_eq!(row["ambiguous_code"], true, "{row}");
+        assert!(row["last_communication"].is_null(), "{row}");
+    }
+
+    // Unknown codes never surface: only real lockers are listed.
+    publish_status(&simulator, "NOPE", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, value) = get(&app, "/api/v1/lockers/presence").await;
+    assert!(
+        value.as_array().unwrap().iter().all(|row| row["code"] != "NOPE"),
+        "{value}"
+    );
+
+    // Backend restart (fresh store, second bridge): the broker replays the
+    // retained OFFLINE — timestamp re-validated, never faking freshness —
+    // so the observed state survives the restart.
+    bridge.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let restarted_store = new_store(Duration::from_secs(90));
+    let app2 = router(
+        pool.clone(),
+        Duration::from_secs(5),
+        None,
+        restarted_store.clone(),
+    );
+    let bridge2 = mqtt::start(
+        pool.clone(),
+        settings.clone(),
+        Arc::new(AtomicBool::new(false)),
+        restarted_store.clone(),
+    );
+    let row = wait_for_presence(&app2, "L2", "OFFLINE").await;
+    assert!(row["source"].is_string(), "{row}");
+    bridge2.abort();
 }

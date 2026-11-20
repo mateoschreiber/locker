@@ -4,7 +4,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use locker_api_rust::{router, MqttSettings, Settings};
+use locker_api_rust::{new_store, router, MqttSettings, Settings};
 use tower::ServiceExt;
 
 fn settings(url: &str) -> Settings {
@@ -19,6 +19,7 @@ fn settings(url: &str) -> Settings {
             port: 1883,
             client_id: "test".to_owned(),
             confirm_timeout: Duration::from_secs(60),
+            stale_seconds: 90,
         },
     }
 }
@@ -26,7 +27,12 @@ fn settings(url: &str) -> Settings {
 #[tokio::test]
 async fn live_and_unavailable_database() {
     let config = settings("postgres://test:test@127.0.0.1:1/test");
-    let app = router(config.pool().unwrap(), config.timeout, None);
+    let app = router(
+        config.pool().unwrap(),
+        config.timeout,
+        None,
+        new_store(Duration::from_secs(90)),
+    );
     let live = app
         .clone()
         .oneshot(
@@ -55,7 +61,12 @@ async fn live_and_unavailable_database() {
 async fn ready_when_test_database_is_available() {
     let url = std::env::var("LOCKER_TEST_DATABASE_URL").expect("LOCKER_TEST_DATABASE_URL required");
     let config = settings(&url);
-    let app = router(config.pool().unwrap(), config.timeout, None);
+    let app = router(
+        config.pool().unwrap(),
+        config.timeout,
+        None,
+        new_store(Duration::from_secs(90)),
+    );
     let response = app
         .oneshot(
             Request::builder()

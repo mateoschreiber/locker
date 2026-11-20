@@ -21,6 +21,9 @@ pub struct MqttSettings {
     pub port: u16,
     pub client_id: String,
     pub confirm_timeout: Duration,
+    /// Presence window (F4.1): status messages older than this at read time
+    /// report STALE instead of ONLINE; LOCKER_OFFLINE always reports OFFLINE.
+    pub stale_seconds: u64,
 }
 
 impl MqttSettings {
@@ -42,12 +45,20 @@ impl MqttSettings {
         if !(1..=600).contains(&seconds) {
             return Err("RUST_MQTT_CONFIRM_TIMEOUT_SECONDS must be between 1 and 600".to_owned());
         }
+        let stale_seconds = env::var("RUST_PRESENCE_STALE_SECONDS")
+            .unwrap_or_else(|_| crate::presence::DEFAULT_STALE_SECONDS.to_string())
+            .parse::<u64>()
+            .map_err(|_| "invalid RUST_PRESENCE_STALE_SECONDS".to_owned())?;
+        if !(30..=600).contains(&stale_seconds) {
+            return Err("RUST_PRESENCE_STALE_SECONDS must be between 30 and 600".to_owned());
+        }
         Ok(Self {
             enabled,
             host,
             port,
             client_id,
             confirm_timeout: Duration::from_secs(seconds),
+            stale_seconds,
         })
     }
 }
@@ -117,6 +128,7 @@ mod tests {
                 port: 1883,
                 client_id: "test".to_owned(),
                 confirm_timeout: Duration::from_secs(60),
+                stale_seconds: 90,
             },
         };
         assert!(settings.pool().is_err());

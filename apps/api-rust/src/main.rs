@@ -1,4 +1,5 @@
 use std::sync::{atomic::AtomicBool, Arc};
+use std::time::Duration;
 
 use locker_api_rust::{mqtt, router, Settings};
 use tracing_subscriber::EnvFilter;
@@ -14,8 +15,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pool()
         .map_err(|_| "invalid PostgreSQL configuration")?;
     let mqtt_ready = Arc::new(AtomicBool::new(false));
+    // Presence lives with the bridge; the endpoint reads the same samples.
+    let presence = locker_api_rust::new_store(Duration::from_secs(settings.mqtt.stale_seconds));
     if settings.mqtt.enabled {
-        mqtt::start(pool.clone(), settings.mqtt.clone(), mqtt_ready.clone());
+        mqtt::start(
+            pool.clone(),
+            settings.mqtt.clone(),
+            mqtt_ready.clone(),
+            presence.clone(),
+        );
     }
     let listener = tokio::net::TcpListener::bind(settings.bind).await?;
     tracing::info!(address = %settings.bind, mqtt = settings.mqtt.enabled, "rust backend started");
@@ -25,9 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    axum::serve(listener, router(pool.clone(), settings.timeout, ready_flag))
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        router(pool.clone(), settings.timeout, ready_flag, presence),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     pool.close().await;
     Ok(())
 }
