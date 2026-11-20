@@ -209,11 +209,15 @@ test('la presencia observada se muestra solo cuando el backend la soporta', asyn
   await enterPanel(data, { capabilities: { resolve: true, presence: true }, presence: presenceRows() })
   fireEvent.click(screen.getByRole('button', { name: /Lockers/ }))
 
-  // Estado administrativo y presencia observada conviven por fila.
-  const online = within(screen.getByText('LAB-LOCKER-001').closest('tr')!)
-  expect(online.getAllByText('ONLINE').length).toBe(2)
-  const offline = within(screen.getByText('LAB-LOCKER-002').closest('tr')!)
-  expect(offline.getByText('OFFLINE')).toBeTruthy()
+  // Estado administrativo y presencia observada conviven por fila. Ambos
+  // llegan por cadenas asíncronas independientes (load, capabilities y el
+  // poll de presencia): se espera la condición funcional, no un retardo.
+  await waitFor(() => {
+    const online = within(screen.getByText('LAB-LOCKER-001').closest('tr')!)
+    expect(online.getAllByText('ONLINE').length).toBe(2)
+    const offline = within(screen.getByText('LAB-LOCKER-002').closest('tr')!)
+    expect(offline.getByText('OFFLINE')).toBeTruthy()
+  })
 
   // El detalle muestra la última comunicación observada.
   fireEvent.click(screen.getByText('LAB-LOCKER-002'))
@@ -293,7 +297,9 @@ test('el panel de operaciones enriquece, filtra y concilia con el veredicto real
   expect(screen.getByText('Taladro')).toBeTruthy()
   fireEvent.change(screen.getByLabelText('Filtro'), { target: { value: 'ALL' } })
 
-  // Detalle con la traza completa y formulario solo para la elegible.
+  // Detalle con la traza completa y formulario solo para la elegible. La
+  // elegibilidad es inmediata, pero el formulario además requiere la
+  // detección asíncrona de capacidades: se espera la condición funcional.
   fireEvent.click(screen.getByText('Llave'))
   const detail = screen.getByText(/Correlación/).parentElement!
   expect(detail.textContent).toContain('corr-2')
@@ -301,7 +307,7 @@ test('el panel de operaciones enriquece, filtra y concilia con el veredicto real
   expect(detail.textContent).toContain('C01')
   expect(detail.textContent).toContain('Administrador')
   expect(detail.textContent).toContain('Compartment is occupied')
-  expect(screen.getByText('Conciliar operación…')).toBeTruthy()
+  await waitFor(() => expect(screen.getByText('Conciliar operación…')).toBeTruthy())
 
   // El operador atestigua CONFIRMED; el backend responde con el estado
   // resultante REAL (FAILED por precondiciones) y así se informa.
@@ -325,14 +331,15 @@ test('solo las operaciones elegibles ofrecen conciliación', async () => {
   await enterPanel(data, { capabilities: { resolve: true, presence: true } })
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
 
-  // CONFIRMED: terminal, nada que conciliar.
+  // CONFIRMED: terminal, nada que conciliar. La leyenda que lo explica
+  // depende de la detección asíncrona de capacidades: condición funcional.
   fireEvent.click(screen.getByText('Taladro'))
+  await waitFor(() => expect(screen.getByText(/no es conciliable/)).toBeTruthy())
   expect(screen.queryByText('Conciliar operación…')).toBeNull()
-  expect(screen.getByText(/no es conciliable/)).toBeTruthy()
 
   // UNKNOWN: elegible.
   fireEvent.click(screen.getByText('Martillo'))
-  expect(screen.getByText('Conciliar operación…')).toBeTruthy()
+  await waitFor(() => expect(screen.getByText('Conciliar operación…')).toBeTruthy())
 })
 
 test('sin capacidad de resolve el backend nunca recibe la solicitud', async () => {
@@ -353,6 +360,7 @@ test('los rechazos del backend en la conciliación se muestran comprensibles', a
   })
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
   fireEvent.click(screen.getByText('Llave'))
+  await waitFor(() => expect(screen.getByText('Conciliar operación…')).toBeTruthy())
   fireEvent.click(screen.getByText('Conciliar operación…'))
   fireEvent.change(screen.getByLabelText('Motivo'), { target: { value: 'motivo' } })
   fireEvent.change(screen.getByLabelText('Evidencia'), { target: { value: 'evidencia' } })
