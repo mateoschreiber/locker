@@ -203,6 +203,25 @@ funciones cuando el backend conectado los anuncia:
   fija la ventana a partir de la cual la comunicación se considera `STALE`;
   configurable en `.env` para el perfil `rust`.
 
+## Panel de operaciones y conciliación (Fase 4.1)
+
+La vista **Operaciones** del panel supervisa el ciclo de vida completo:
+estado, tipo, herramienta, locker/compartimento, usuario, correlación,
+origen y fechas de solicitud, publicación y confirmación, con filtro por
+estado y detalle expandible que conserva los identificadores técnicos. Las
+operaciones que requieren intervención (UNKNOWN, o FAILED que aún retiene un
+préstamo pendiente) se marcan y ordenan primero; el dashboard las refleja.
+
+La conciliación usa el endpoint Rust `POST /operations/{id}/resolve` con el
+token de la sesión de laboratorio (nunca una constante en el código): exige
+veredicto, motivo y evidencia, explica las consecuencias antes de ejecutar y
+muestra el estado resultante real de la respuesta del backend — un veredicto
+CONFIRMED cuyas precondiciones fallan se informa como FAILED con su motivo.
+Solo se ofrece para operaciones elegibles; los rechazos del backend (401,
+409, 422, 503) y los fallos de red se presentan con su mensaje. Python no
+implementa `resolve`: el panel lo detecta por `GET /api/v1/capabilities` y
+nunca envía esa solicitud al backend conectado si no la anuncia.
+
 ## Desarrollo
 
 Ejecute las validaciones desde cada aplicación:

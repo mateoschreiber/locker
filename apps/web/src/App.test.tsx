@@ -248,3 +248,116 @@ test('el dashboard no muestra todo listo mientras exista una intervención', asy
   await enterPanel(clean, { capabilities: { resolve: true, presence: true }, presence: presenceRows().slice(0, 1) })
   expect(screen.getByText('Todo listo para operar')).toBeTruthy()
 })
+
+// ---------------------------------------------------------------------------
+// F4.1-B: operations supervision and reconciliation.
+// ---------------------------------------------------------------------------
+
+function operationsFixture(): Data {
+  const data = fixture()
+  data.lockers = [{ id: 'k1', code: 'L1', name: 'Locker principal', status: 'ONLINE' }]
+  data.compartments = [{ id: 'c1', code: 'C01', name: 'C01', locker_id: 'k1', status: 'ACTIVE', position: 1 }]
+  data.loans = [
+    { id: 'l1', status: 'RETURN_PENDING', tool_id: 't2', user_id: 'u1' },
+    { id: 'l2', status: 'RETURNED', tool_id: 't1', user_id: 'u1', returned_at: '2026-01-02T00:00:00Z' },
+    { id: 'l3', status: 'RETURN_PENDING', tool_id: 't3', user_id: 'u1' },
+  ]
+  data.operations = [
+    { id: 'op1', status: 'CONFIRMED', command_type: 'CHECKOUT', tool_id: 't1', loan_id: 'l2', branch_id: 'b1', locker_id: 'k1', compartment_id: 'c1', correlation_id: 'corr-1', origin: 'rust', created_at: '2026-01-01T00:00:00Z', published_at: '2026-01-01T00:00:01Z', confirmed_at: '2026-01-01T00:00:02Z', failure_reason: null },
+    { id: 'op2', status: 'FAILED', command_type: 'RETURN', tool_id: 't2', loan_id: 'l1', branch_id: 'b1', locker_id: 'k1', compartment_id: 'c1', correlation_id: 'corr-2', origin: 'rust', created_at: '2026-01-03T00:00:00Z', published_at: '2026-01-03T00:00:01Z', confirmed_at: '2026-01-03T00:00:05Z', failure_reason: 'Compartment is occupied' },
+    { id: 'op3', status: 'UNKNOWN', command_type: 'RETURN', tool_id: 't3', loan_id: 'l3', branch_id: 'b1', locker_id: 'k1', compartment_id: 'c1', correlation_id: 'corr-3', origin: 'rust', created_at: '2026-01-04T00:00:00Z', published_at: '2026-01-04T00:00:01Z', confirmed_at: null, failure_reason: null },
+  ]
+  return data
+}
+
+test('el panel de operaciones enriquece, filtra y concilia con el veredicto real', async () => {
+  const data = operationsFixture()
+  const api = await enterPanel(data, {
+    capabilities: { resolve: true, presence: true },
+    mutation: () => ({ ok: true, body: { status: 'FAILED', failure_reason: 'Compartment is occupied' } }),
+  })
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+
+  // Nombres y códigos legibles; las que requieren atención van primero.
+  expect(screen.getByText('Taladro')).toBeTruthy()
+  expect(screen.queryByText(/^[0-9a-f]{8}-/)).toBeNull()
+  const failed = within(screen.getByText('Llave').closest('tr')!)
+  expect(failed.getByText('⚠')).toBeTruthy()
+  const confirmed = within(screen.getByText('Taladro').closest('tr')!)
+  expect(confirmed.queryByText('⚠')).toBeNull()
+
+  // Filtro por estado.
+  fireEvent.change(screen.getByLabelText('Filtro'), { target: { value: 'CONFIRMED' } })
+  expect(screen.queryByText('Llave')).toBeNull()
+  expect(screen.queryByText('Martillo')).toBeNull()
+  expect(screen.getByText('Taladro')).toBeTruthy()
+  fireEvent.change(screen.getByLabelText('Filtro'), { target: { value: 'ALL' } })
+
+  // Detalle con la traza completa y formulario solo para la elegible.
+  fireEvent.click(screen.getByText('Llave'))
+  const detail = screen.getByText(/Correlación/).parentElement!
+  expect(detail.textContent).toContain('corr-2')
+  expect(detail.textContent).toContain('L1')
+  expect(detail.textContent).toContain('C01')
+  expect(detail.textContent).toContain('Administrador')
+  expect(detail.textContent).toContain('Compartment is occupied')
+  expect(screen.getByText('Conciliar operación…')).toBeTruthy()
+
+  // El operador atestigua CONFIRMED; el backend responde con el estado
+  // resultante REAL (FAILED por precondiciones) y así se informa.
+  fireEvent.click(screen.getByText('Conciliar operación…'))
+  fireEvent.change(screen.getByLabelText('Veredicto'), { target: { value: 'CONFIRMED' } })
+  fireEvent.change(screen.getByLabelText('Motivo'), { target: { value: 'verificado en sitio' } })
+  fireEvent.change(screen.getByLabelText('Evidencia'), { target: { value: 'fotos y registro' } })
+  fireEvent.click(screen.getByText('Confirmar resolución'))
+  const resolveCall = api.calls.find(({ url }) => url === '/api/v1/operations/op2/resolve')
+  expect(resolveCall).toBeTruthy()
+  expect(resolveCall!.init!.method).toBe('POST')
+  expect((resolveCall!.init!.headers as Record<string, string>).Authorization).toBe('Bearer lab-admin-token')
+  expect(JSON.parse(String(resolveCall!.init!.body))).toEqual({
+    outcome: 'CONFIRMED', reason: 'verificado en sitio', evidence: 'fotos y registro',
+  })
+  await waitFor(() => expect(screen.getByText(/Estado resultante: FAILED/).textContent).toContain('Compartment is occupied'))
+})
+
+test('solo las operaciones elegibles ofrecen conciliación', async () => {
+  const data = operationsFixture()
+  await enterPanel(data, { capabilities: { resolve: true, presence: true } })
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+
+  // CONFIRMED: terminal, nada que conciliar.
+  fireEvent.click(screen.getByText('Taladro'))
+  expect(screen.queryByText('Conciliar operación…')).toBeNull()
+  expect(screen.getByText(/no es conciliable/)).toBeTruthy()
+
+  // UNKNOWN: elegible.
+  fireEvent.click(screen.getByText('Martillo'))
+  expect(screen.getByText('Conciliar operación…')).toBeTruthy()
+})
+
+test('sin capacidad de resolve el backend nunca recibe la solicitud', async () => {
+  const data = operationsFixture()
+  const api = await enterPanel(data) // sin capabilities: como el backend Python
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  fireEvent.click(screen.getByText('Martillo'))
+  expect(screen.queryByText('Conciliar operación…')).toBeNull()
+  expect(screen.getByText(/exclusiva del backend Rust/)).toBeTruthy()
+  expect(api.calls.every(({ url }) => !url.includes('/resolve'))).toBe(true)
+})
+
+test('los rechazos del backend en la conciliación se muestran comprensibles', async () => {
+  const data = operationsFixture()
+  await enterPanel(data, {
+    capabilities: { resolve: true, presence: true },
+    mutation: () => ({ ok: false, body: { detail: 'La operación fallida ya no retiene recursos del dominio' } }),
+  })
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  fireEvent.click(screen.getByText('Llave'))
+  fireEvent.click(screen.getByText('Conciliar operación…'))
+  fireEvent.change(screen.getByLabelText('Motivo'), { target: { value: 'motivo' } })
+  fireEvent.change(screen.getByLabelText('Evidencia'), { target: { value: 'evidencia' } })
+  fireEvent.click(screen.getByText('Confirmar resolución'))
+  await waitFor(() =>
+    expect(screen.getByText('La operación fallida ya no retiene recursos del dominio')).toBeTruthy(),
+  )
+})

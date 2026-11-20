@@ -91,8 +91,9 @@ Reglas:
   `OPERATION_RESOLVED_CONFIRMED` con `status: FAILED` en sus metadatos.
 - Un evento MQTT tardío tras la resolución se ignora y se registra en el log:
   el estado terminal y la atestación del operador prevalecen. El panel
-  administrativo debe mostrar `status` y `failure_reason` de la respuesta
-  (pendiente para la Fase 4).
+  administrativo muestra `status` y `failure_reason` de la respuesta: el
+  backend es la autoridad final y un veredicto CONFIRMED que no puede
+  aplicarse se informa con su estado resultante real (F4.1-B).
 
 Si no existe información suficiente, la operación permanece `UNKNOWN` con sus
 recursos bloqueados y debe reportarse para conciliación operativa.

@@ -426,6 +426,41 @@ pruebas web (7 de componentes: presencia por locker con y sin capacidades,
 dashboard con intervención pendiente). La paridad no cambia sus contratos
 compartidos; la validación completa de F4.1 se ejecuta al cierre del bloque C.
 
+## Avance de Fase 4.1 — B: panel de operaciones y conciliación
+
+- Nueva vista **Operaciones**: estado, tipo, herramienta, locker y
+  compartimento, usuario, correlación, origen y fechas de solicitud,
+  publicación y confirmación con filtro por estado y detalle expandible. Los
+  identificadores legibles (código/nombre) reemplazan a los UUID como
+  identificador principal; los técnicos quedan accesibles en el detalle. Las
+  operaciones que requieren intervención (UNKNOWN, o FAILED con préstamo
+  pendiente) se marcan y ordenan primero, y el dashboard las refleja junto a
+  la presencia.
+- Conciliación: reusa `POST /operations/{id}/resolve` **sin cambios de
+  semántica** (restricción de F4.0 respetada). El formulario exige veredicto,
+  motivo y evidencia con confirmación explícita y explica las consecuencias;
+  la respuesta del backend es la autoridad final — un CONFIRMED que no puede
+  aplicarse se informa con su estado resultante real (`status` +
+  `failure_reason`). Tras resolver se refrescan operaciones, préstamos y
+  auditoría, y una segunda resolución terminal se rechaza del lado del
+  backend y se muestra comprensible.
+- Token de laboratorio: el panel guarda el `access_token` de la respuesta de
+  login en memoria (ninguna constante nueva) y lo envía únicamente en la
+  solicitud de conciliación.
+- Compatibilidad: el formulario y el badge de intervención solo se ofrecen
+  cuando `GET /api/v1/capabilities` declara `resolve` (Python responde 404;
+  el panel nunca le envía esa solicitud), con prueba explícita de que la
+  solicitud no se emite.
+
+Validación local ejecutada (20-11-2026): lint, build y pruebas web
+**11/11** (4 nuevas de F4.1-B: enriquecimiento con nombres/códigos y orden por
+intervención, filtro por estado, elegibilidad UNKNOWN/FAILED-con-préstamo vs
+CONFIRMED, veredicto CONFIRMED con respuesta FAILED real y header
+`Authorization`, rechazo 409 comprensible y backend sin capacidad que jamás
+recibe la solicitud). El backend no cambió: `resolve`, elegibilidad y
+`capabilities` ya estaban validados por las 27 pruebas de integración de
+F4.0/F4.1-A.
+
 ## Cierre de los tres hallazgos de Fase 0
 
 
