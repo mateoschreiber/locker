@@ -507,6 +507,65 @@ sin cambios); `docker compose config` (laboratorio, perfil `rust` y preview)
 sin problemas; lint, build y pruebas web **11/11**; `git diff --check`
 limpio. Sin cutover: Python sigue atendiendo el laboratorio.
 
+## Fase 4.1 — cierre, estabilización y estado (20-11-2026)
+
+F4.1 queda **completada localmente**: presencia observada (A), panel de
+operaciones y conciliación (B) y entorno aislado con smoke reproducible (C).
+Commits: `763d92b` (A), `b7aa420` (B), `ce830ec` (C), `fefa49f` (regresiones
+de la revisión final), `4aba638` y `4d4ffd5` (estabilización de CI). Sin
+cutover: Python sigue conectado al laboratorio; Rust permanece aislado.
+
+### Estabilización tras la revisión final
+
+- **CI #21 — `cargo fmt --check`:** deriva de versión de rustfmt entre el
+  toolchain local en Docker (cacheado, 1.100) y el stable del runner, que
+  reformatea distinto desde `tests/api.rs:2665`. Corregido ejecutando
+  `cargo fmt` con la imagen `rust:latest` recién descargada (97 líneas, solo
+  reflujo, sin cambio de comportamiento) y re-validando fmt/clippy/8+28
+  pruebas con ese mismo toolchain. Lección registrada: verificar formato con
+  el toolchain vigente de CI, no con imágenes cacheadas.
+- **CI #22 — prueba asíncrona de presencia:** carrera real, confirmada en el
+  código — `load()`, `capabilities` y el poll de presencia son cadenas
+  asíncronas independientes, y el helper del test solo esperaba la primera,
+  afirmando antes de que la presencia aterrizara (1 badge en vez de 2).
+  Corregido con `waitFor` sobre condiciones funcionales (sin sleeps ni
+  timeouts globales) en las cuatro pruebas dependientes de capacidades;
+  verificado 6 corridas en Windows y 2 en contenedor Linux node:22.
+- **Preview interactivo:** `scripts/rust-preview.ps1` (start/stop/status/
+  init/reset desde cualquier directorio) verificado de punta a punta,
+  incluyendo primera vez con auto-inicialización (solo entonces; nunca
+  re-siembra una base con datos), parada que conserva volúmenes y ciclo
+  completo de login end-to-end por nginx en `http://127.0.0.1:8084` con el
+  laboratorio 8083 intacto durante todo el ciclo.
+
+### Revisión técnica de cierre — hallazgos y destino
+
+1. **El puente Rust acepta cualquier SubAck como suscripción exitosa**
+   (Python valida los reason codes). Latente y pre-existente desde Fase 3:
+   el laboratorio (broker anónimo sin ACL) no puede dispararlo. Asignado a
+   **F5** junto con MQTT con identidad/TLS, donde un rechazo real de
+   suscripción será probable y la validación (≈6 líneas + prueba) se hace
+   con ACLs reales.
+2. Parámetro muerto en el helper de tests de presencia y doble convención de
+   identificación (UUID crudo vs nombre) entre la vista 'Operación' y la
+   nueva 'Operaciones': cosméticos, asignados a **F4.2** (pulido del panel).
+
+### Estado de la migración y condiciones para avanzar
+
+- Fases 0–3 y F4.0 completadas y validadas en CI (#19/#20). F4.1 completa
+  localmente; **pendiente: validación remota de CI sobre los commits de
+  F4.1 al publicar** (run pendiente validará fmt corregido, la estabilización
+  de tests web y el smoke del preview incorporado al job `compose`).
+- Riesgos abiertos sin cambios: autenticación/token fijo y MQTT anónimo sin
+  TLS (#1/#3), almacenamiento de contraseñas en claro (#2) — F5; presencia
+  en memoria con crecimiento por código visto (atajo documentado) — F5;
+  paginación y carga por vista (#13) — F4.2.
+- Próximo bloque: **F4.2** — paginación y carga por vista sobre la línea
+  base de `docs/PERFORMANCE_BASELINE.md` (el ciclo contra Rust es 16
+  solicitudes; contra Python queda en 15), unificación de convenciones del
+  panel, y medición comparada antes del cutover. El cutover y la retirada de
+  Python siguen siendo condiciones explícitas posteriores a F4.2.
+
 ## Cierre de los tres hallazgos de Fase 0
 
 
