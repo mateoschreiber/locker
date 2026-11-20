@@ -330,6 +330,25 @@ qué backend está conectado ni inicia F4.1/F4.2.
   [`docs/PERFORMANCE_BASELINE.md`](docs/PERFORMANCE_BASELINE.md) para comparar
   F4.2 (cálculo del ciclo, latencias, tamaños, CPU/RAM observados).
 
+Decisión sobre propiedad y conciliación (revisión de cierre de F4.0): el
+`resolve` es deliberadamente transversal a `origin`. La propiedad exclusiva
+(#12) rige el reclamo y la confirmación automáticos del puente (particionados
+por `origin` y estados, sin cambios); la conciliación es una acción
+administrativa autenticada, con evidencia exigida y auditoría con veredicto.
+Restringirla por origen dejaría sin salida préstamos atascados del otro
+backend en la base compartida de coexistencia (Python no tiene `resolve`).
+Riesgo conocido y aceptado: un operador puede terminar una operación creada
+por el otro backend; lo mitigan el token, la evidencia y la auditoría.
+
+Corrección de cierre (mismo día, revisión final): el contrato de estado
+completó los bordes que la primera iteración no cubría. `status: null` cuenta
+como campo ausente en ambos backends (PATCH sin cambio involuntario, creación
+con el valor por defecto — antes Python respondía 422); los valores que no
+son texto responden `422 "Campo 'status': se requiere texto"` idéntico en
+ambos (antes divergía el `detail`); ambos bordes tienen casos explícitos en la
+paridad y en la suite aislada de Python. Sin cambios en Rust: su semántica
+(null ausente, tipo texto) es la que Python ahora replica.
+
 Validación local ejecutada (20-11-2026): `cargo fmt --check`,
 `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`
 (6 unitarias) y `cargo test --locked -- --ignored --test-threads=1` con

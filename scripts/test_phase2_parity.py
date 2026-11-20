@@ -268,6 +268,25 @@ def main():
         error_parity(python_base, rust_base, 'compartment with placement', 'POST',
                      f"/api/v1/compartments/{compartments[0]['id']}/deactivate")
 
+        # F4.0-fix: status edge parity. Rust treats null as an absent field and
+        # rejects non-strings as a type error; Python must answer identically.
+        for base in (python_base, rust_base):
+            status, value = http('PATCH', base + f"/api/v1/branches/{branch['id']}",
+                                 {'status': None})
+            assert status == 200, f'null status PATCH: {status} ({value})'
+            assert value['status'] == branch['status'], value
+            code = f'NULA-{uuid4().hex[:8]}'
+            status, value = http('POST', base + '/api/v1/branches',
+                                 {'code': code, 'name': 'Status nulo', 'status': None})
+            assert status == 201, f'null status create: {status} ({value})'
+            assert value['status'] == 'ACTIVE', value
+        for invalid in (5, True, ['ACTIVE'], {'code': 'X'}):
+            error_parity(python_base, rust_base, f'non-string status {invalid!r}', 'PATCH',
+                         f"/api/v1/branches/{branch['id']}", {'status': invalid},
+                         expected=422)
+        error_parity(python_base, rust_base, 'empty status', 'PATCH',
+                     f"/api/v1/branches/{branch['id']}", {'status': ''}, expected=422)
+
         # 7. Parity of the detail endpoints after the flow.
         _, python_detail = http('GET', python_base + f"/api/v1/lockers/{locker['id']}/detail")
         _, rust_detail = http('GET', rust_base + f"/api/v1/lockers/{locker['id']}/detail")

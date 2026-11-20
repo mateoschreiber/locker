@@ -115,6 +115,13 @@ RESERVED_RETURN_STATUSES = ("PENDING", "PUBLISHING", "PUBLISHED", "UNKNOWN")
 
 
 def check_status(path: str, value: object) -> None:
+    # Mirrors Rust `field_value`: a non-string status is a type error with the
+    # exact same message; null never reaches here (callers drop it first,
+    # matching Rust's "null counts as absent").
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=422, detail="Campo 'status': se requiere texto"
+        )
     allowed = ALLOWED_STATUSES.get(path, ())
     if allowed and value not in allowed:
         raise HTTPException(
@@ -175,6 +182,9 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
 
     @router.post(path, status_code=status.HTTP_201_CREATED, tags=["administración"])
     def create(payload: dict[str, object], session: Session = Depends(get_db)) -> dict[str, object]:
+        # Rust parity: null counts as an absent status, so the default applies.
+        if payload.get("status") is None:
+            payload.pop("status", None)
         if "status" in payload:
             check_status(path, payload["status"])
         item = model(**payload)
@@ -191,6 +201,10 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
         item = session.get(model, item_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Registro no encontrado")
+        # Rust parity: null counts as an absent status, so PATCH leaves the
+        # current state untouched instead of failing or clearing it.
+        if payload.get("status") is None:
+            payload.pop("status", None)
         if "status" in payload:
             check_status(path, payload["status"])
             guard_status_change(session, path, item_id)

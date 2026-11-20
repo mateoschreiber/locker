@@ -213,6 +213,27 @@ def test_status_contract_password_exclusion_and_guards() -> None:
         assert rejected.status_code == 422
         assert rejected.json()['detail'] == "Campo 'status': debe ser uno de ONLINE, INACTIVE"
 
+        # Rust parity: null counts as an absent status (PATCH leaves the row
+        # untouched; creation applies the default), and non-strings are the
+        # same 422 with the same message as Rust's type validation.
+        patched = client.patch(f"/api/v1/branches/{branch['id']}", json={'status': None})
+        assert patched.status_code == 200
+        assert patched.json()['status'] == branch['status']
+        created = client.post('/api/v1/tools', json={
+            'asset_code': f'TOOL-{uuid4().hex[:8]}', 'name': 'Con nulo', 'status': None})
+        assert created.status_code == 201
+        assert created.json()['status'] == 'AVAILABLE'
+        for invalid in (5, True, ['ACTIVE'], {'code': 'X'}, ''):
+            rejected = client.patch(f"/api/v1/branches/{branch['id']}",
+                                    json={'status': invalid})
+            if isinstance(invalid, str):
+                assert rejected.json()['detail'] == (
+                    "Campo 'status': debe ser uno de ACTIVE, INACTIVE")
+            else:
+                assert rejected.json()['detail'] == "Campo 'status': se requiere texto"
+            assert rejected.status_code == 422
+        assert client.get(f"/api/v1/branches/{branch['id']}").json()['status'] == branch['status']
+
         # ON_LOAN is domain-only: never administratively creatable.
         rejected = client.post('/api/v1/tools', json={
             'asset_code': f'TOOL-{uuid4().hex[:8]}', 'name': 'X', 'status': 'ON_LOAN'})
