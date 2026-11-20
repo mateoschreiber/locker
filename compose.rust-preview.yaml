@@ -4,7 +4,9 @@
 # so no command reaches the active simulator). Initialized explicitly by
 # scripts/test_rust_preview.py (alembic upgrade + LAB seed through the
 # `init` profile). Short confirmation TTL so uncertain operations become
-# UNKNOWN quickly in smoke scenarios.
+# UNKNOWN quickly in smoke scenarios. The host port comes from
+# LOCKER_PREVIEW_PORT (8084 interactively, 8085 for the automated smoke's
+# separate project) so one file serves both stacks without sharing data.
 services:
   postgres:
     image: postgres:17-alpine
@@ -78,7 +80,7 @@ services:
     volumes:
       - ./apps/web/nginx/rust.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "127.0.0.1:8084:80"
+      - "127.0.0.1:${LOCKER_PREVIEW_PORT:-8084}:80"
     depends_on:
       - api-rust
 

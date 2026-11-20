@@ -19,3 +19,4 @@ coverage/
 *.log
 data/
 mosquitto-data/
+.local-validation/

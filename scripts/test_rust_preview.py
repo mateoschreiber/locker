@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""End-to-end smoke of the React panel against the Rust backend (F4.1-C).
+"""End-to-end smoke of the React panel against the Rust backend (F4.1-C/D).
 
-Disposable stack via compose.rust-preview.yaml: isolated PostgreSQL with the
-LAB schema and seed initialized explicitly, an isolated broker and simulator,
-the Rust API and an nginx web container pointed at Rust. Nothing from the
-laboratory stack is reused (separate project, network, broker and volumes).
+Disposable stack via compose.rust-preview.yaml under its own project
+(locker-rust-preview-test, port 8085 by default): isolated PostgreSQL with
+the LAB schema and seed initialized explicitly, an isolated broker and
+simulator, the Rust API and an nginx web container pointed at Rust. Nothing
+from the laboratory stack is reused, and nothing from the interactive
+preview (project locker-rust-preview, port 8084) is touched or destroyed —
+if that preview happens to be running, its health and row counts are
+snapshotted read-only before the scenario and asserted unchanged after it.
 
 Scenarios: capabilities and login through nginx, observed presence (ONLINE
 from the simulator, OFFLINE from its Last Will), a full checkout/return flow
 confirmed by the simulator, a forced UNKNOWN by TTL (simulator stopped)
 reconciled as FAILED with the loan released, and a real api-rust restart
 mid-operation reconciled as CONFIRMED with the domain effects applied.
+
+On any failure the script captures evidence (compose ps, logs of every
+service, health/ready failure mode) under .local-validation/ BEFORE the
+disposable teardown, so a CI failure can be diagnosed post-mortem.
 """
 
 import json
@@ -21,14 +29,21 @@ import time
 import urllib.error
 import urllib.request
 
-PROJECT = 'locker-rust-preview'
+PROJECT = 'locker-rust-preview-test'
+INTERACTIVE_PROJECT = 'locker-rust-preview'
 COMPOSE = ['docker', 'compose', '-p', PROJECT, '-f', 'compose.rust-preview.yaml']
-BASE = 'http://127.0.0.1:8084'
-DB_URL = 'postgresql+psycopg://locker_rust:rust_test_only@postgres:5432/locker_rust'
+PORT = int(os.environ.get('LOCKER_PREVIEW_TEST_PORT', '8085'))
+BASE = f'http://127.0.0.1:{PORT}'
+EVIDENCE_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.local-validation')
 
 
 def compose(*args, check=True):
-    return subprocess.run([*COMPOSE, *args], check=check, capture_output=True, text=True)
+    # LOCKER_PREVIEW_PORT drives the compose file's published port; the OS
+    # environment takes precedence over any .env file, so the test project
+    # can never collide with the interactive preview on 8084.
+    env = {**os.environ, 'LOCKER_PREVIEW_PORT': str(PORT)}
+    return subprocess.run([*COMPOSE, *args], check=check, capture_output=True, text=True, env=env)
 
 
 def call(method, path, body=None, token=None):
@@ -53,14 +68,78 @@ def call(method, path, body=None, token=None):
         return None, {}
 
 
-def wait_until(description, predicate, seconds=90):
+def probe(path):
+    """One health observation with the failure mode spelled out: 200 ok,
+    503 = api answered but not ready (DB/MQTT), 502 = nginx without its
+    upstream (api restarting), refused/timeout = web container itself
+    unreachable. Read-only diagnostics; never a password or token."""
+    request = urllib.request.Request(BASE + path)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return f'{response.status} ok'
+    except urllib.error.HTTPError as error:
+        return {503: '503 api answered: not ready', 502: '502 nginx: upstream unavailable'}.get(
+            error.code, f'{error.code} http error')
+    except urllib.error.URLError as error:
+        return f'no connection ({error.reason})'
+    except OSError as error:
+        return f'no connection ({error})'
+
+
+def capture_evidence(stage):
+    directory = os.path.join(
+        EVIDENCE_ROOT, f'preview-smoke-{time.strftime("%Y%m%d-%H%M%S")}')
+    os.makedirs(directory, exist_ok=True)
+    def save(name, text):
+        with open(os.path.join(directory, name), 'w', encoding='utf-8') as handle:
+            handle.write(text or '')
+    save('stage.txt', stage)
+    state = compose('ps', check=False)
+    save('compose-ps.txt', state.stdout + state.stderr)
+    for service in ('api-rust', 'postgres', 'mosquitto', 'web-rust'):
+        logs = compose('logs', '--no-color', '--tail', '300', service, check=False)
+        save(f'logs-{service}.txt', logs.stdout + logs.stderr)
+    save(
+        'health.txt',
+        f'stage: {stage}\nhealth/live: {probe("/health/live")}\n'
+        f'health/ready: {probe("/health/ready")}\n')
+    print(f'preview evidence captured in {directory}', file=sys.stderr)
+
+
+def wait_until(description, predicate, seconds=90, observer=None):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if predicate():
             print(f'preview OK: {description}')
             return
         time.sleep(1)
-    raise RuntimeError(f'timeout waiting for {description}')
+    detail = f' [{observer()}]' if observer else ''
+    raise RuntimeError(f'timeout waiting for {description}{detail}')
+
+
+def ready_observer():
+    return f'live: {probe("/health/live")}; ready: {probe("/health/ready")}'
+
+
+def interactive_preview_running():
+    result = subprocess.run(
+        ['docker', 'compose', '-p', INTERACTIVE_PROJECT, '-f', 'compose.rust-preview.yaml',
+         'ps', '--status', 'running'],
+        capture_output=True, text=True)
+    return bool(result.stdout.strip())
+
+
+def interactive_preview_snapshot():
+    """Read-only marker of the user's interactive preview: its health and
+    its row counts. Nothing is inserted, modified or removed there."""
+    counts = subprocess.run(
+        ['docker', 'compose', '-p', INTERACTIVE_PROJECT, '-f', 'compose.rust-preview.yaml',
+         'exec', '-T', 'postgres', 'psql', '-U', 'locker_rust', '-d', 'locker_rust', '-tAc',
+         "SELECT (SELECT count(*) FROM branches) || '/' || (SELECT count(*) FROM tools) || "
+         "'/' || (SELECT count(*) FROM users) || '/' || (SELECT count(*) FROM loans) || "
+         "'/' || (SELECT count(*) FROM locker_operations)"],
+        capture_output=True, text=True)
+    return counts.stdout.strip()
 
 
 def wait_status(operation_id, wanted, seconds=60):
@@ -77,6 +156,13 @@ def loan_status(loan_id):
 
 
 def main():
+    watched = interactive_preview_running()
+    snapshot = interactive_preview_snapshot() if watched else None
+    if watched:
+        print(f'interactive preview detected (project {INTERACTIVE_PROJECT}); '
+              'its data must remain untouched by this smoke')
+    else:
+        print(f'interactive preview not running; read-only isolation check skipped')
     try:
         print('building the preview images...')
         compose('build')
@@ -93,7 +179,8 @@ def main():
         compose('run', '--rm', 'init', 'python', '-m', 'app.modules.seed')
         compose('up', '-d', 'simulator', 'api-rust', 'web-rust')
 
-        wait_until('web /health/ready 200 (Rust subscribed)', lambda: call('GET', '/health/ready')[0] == 200)
+        wait_until('web /health/ready 200 (Rust subscribed)', lambda: call('GET', '/health/ready')[0] == 200,
+                   observer=ready_observer)
 
         # 1. Capabilities: the panel feature gate.
         status, caps = call('GET', '/api/v1/capabilities')
@@ -148,7 +235,7 @@ def main():
         # gated on the events subscription) and the persisted retained OFFLINE
         # replays — an old message that can never fake freshness.
         compose('restart', 'mosquitto')
-        wait_until('api-rust ready after broker restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180)
+        wait_until('api-rust ready after broker restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180, observer=ready_observer)
         wait_until('presence OFFLINE restored by retained replay', locker_offline)
 
         status, authorization2 = call('POST', '/api/v1/authorizations', {
@@ -188,7 +275,7 @@ def main():
         status, returning = call('POST', f"/api/v1/loans/{reusable['loan_id']}/return")
         assert status == 202, returning
         compose('restart', 'api-rust')
-        wait_until('api-rust ready after mid-operation restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180)
+        wait_until('api-rust ready after mid-operation restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180, observer=ready_observer)
         wait_status(returning['id'], 'UNKNOWN', seconds=60)
         status, applied = call('POST', f"/api/v1/operations/{returning['id']}/resolve", {
             'outcome': 'CONFIRMED', 'reason': 'herramienta devuelta en sitio',
@@ -201,8 +288,17 @@ def main():
             'resolution missing from the audit trail'
         print('preview OK: real restart mid-operation -> UNKNOWN -> CONFIRMED with domain effects and audit')
 
+        if watched:
+            after = interactive_preview_snapshot()
+            assert after == snapshot, \
+                f'interactive preview data changed during the smoke: {snapshot} -> {after}'
+            print(f'preview OK: interactive preview data preserved ({snapshot})')
+
         print('Rust preview smoke: capabilities, presence, loan flow, TTL UNKNOWN, '
               'reconciliation and real restart: OK')
+    except Exception as error:
+        capture_evidence(f'{error.__class__.__name__}: {error}')
+        raise
     finally:
         if not os.environ.get('LOCKER_PREVIEW_KEEP'):
             compose('down', '-v', check=False)

@@ -11,8 +11,9 @@
 #   .\rust-preview.ps1 init     # explicit alembic + seed (refuses non-empty DB)
 #   .\rust-preview.ps1 reset    # explicit teardown WITH volumes (destroys data)
 #
-# The CI smoke (scripts/test_rust_preview.py) keeps its own disposable
-# lifecycle and is unaffected by this script.
+# The automated smoke (scripts/test_rust_preview.py) runs under its own
+# project locker-rust-preview-test on port 8085 and never touches this
+# stack's containers, volumes or data.
 
 [CmdletBinding()]
 param(
@@ -25,6 +26,10 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $composeFile = Join-Path $repo 'compose.rust-preview.yaml'
 $base = 'http://127.0.0.1:8084'
+# The compose file publishes ${LOCKER_PREVIEW_PORT:-8084}; pin it so this
+# interactive stack can never drift onto the automated smoke's port (8085,
+# project locker-rust-preview-test).
+$env:LOCKER_PREVIEW_PORT = '8084'
 
 if (-not (Test-Path $composeFile)) {
     throw "compose.rust-preview.yaml not found at $composeFile"

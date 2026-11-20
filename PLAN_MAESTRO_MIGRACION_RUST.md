@@ -575,3 +575,194 @@ cutover: Python sigue conectado al laboratorio; Rust permanece aislado.
 3. **Reinicio real Docker:** `python scripts/test_docker_restart.py` crea un proyecto Compose aislado con el Dockerfile normal, verifica arranque sin seed y login después del seed explícito, crea un préstamo, reinicia el contenedor y compara exactamente préstamos, ubicaciones y conteos de todas las tablas. Después ejecuta devolución, nuevo retiro y devolución. Sus recursos temporales se eliminan al terminar.
 
 Validación ejecutada: integración API/PostgreSQL/MQTT 7 pruebas; simulador 4 pruebas; escenario de reinicio Docker aprobado; Ruff y mypy de API, Ruff de simulador, lint/build/test web (1 prueba), comprobación de Compose y `git diff --check` satisfactorios. La integración incluye avisos de deprecación existentes de FastAPI/Starlette. No se han probado hardware ni datos históricos.
+
+## F4.1-D — diagnóstico del CI #23, aislamiento real y validación local (20-11-2026)
+
+### Causa raíz del CI #23 — confirmada con evidencia
+
+Error reportado: `preview FAILED: timeout waiting for api-rust ready after
+mid-operation restart`. Reproducido localmente en el proyecto aislado de
+pruebas antes de tocar nada. La evidencia capturada antes del desmonte
+desechable (`.local-validation/preview-smoke-20261120-134629/`) muestra:
+
+- `docker compose ps`: api-rust **Up**.
+- Logs de api-rust: proceso iniciado y `mqtt_events_subscribed` un segundo
+  después del reinicio — el backend y su puente MQTT estaban sanos y
+  ready por sí mismos.
+- Logs de nginx: `connect() failed (113: Host is unreachable)` hacia
+  `http://172.23.0.5:8001` — **la IP antigua**.
+
+`docker compose restart` detiene el contenedor (el endpoint de red se
+libera) y al arrancar puede recibir otra IP. nginx resuelve el nombre del
+upstream una única vez al cargar la configuración (`proxy_pass
+http://api-rust:8001` estático), de modo que tras el reinicio seguía
+marcando la IP muerta para siempre: 502 persistente que ningún timeout de
+smoke puede superar. Ni SubAck, ni PostgreSQL, ni la recuperación de
+operaciones tenían relación con el fallo; aumentar timeouts no lo habría
+resuelto nunca.
+
+Corrección mínima (`apps/web/nginx/rust.conf`): el upstream se pasa por
+variable (`set $rust_upstream api-rust:8001; proxy_pass
+http://$rust_upstream;`) con `resolver 127.0.0.11 valid=5s` (DNS embebido
+de Docker), de modo que nginx re-resuelve periódicamente y el reinicio del
+backend se recupera en segundos. Regresión demostrada: el paso 6 del smoke
+(reinicio real mid-operation) fallaba con el código anterior y pasa tras el
+cambio, con la conciliación UNKNOWN→CONFIRMED y auditoría verificadas.
+
+Observabilidad permanente añadida al smoke: ante cualquier fallo captura
+`compose ps`, logs de api-rust/postgres/mosquitto/web-rust y el modo de
+fallo de `health/live` y `health/ready` (502 = nginx sin upstream, 503 =
+API viva pero no ready, timeout/rechazo) en `.local-validation/` antes del
+`down -v`. Sin contraseñas ni tokens en la evidencia.
+
+### Defectos latentes del puente corregidos en el mismo bloque
+
+1. **SubAck sin validar** (hallazgo 1 de la revisión de cierre, adelantado
+   desde F5 porque el diagnóstico lo puso en el camino): el puente marcaba
+   `subscribed=true` ante cualquier SUBACK, y MQTT 3.1.1 rechaza
+   suscripciones con 0x80 dentro de un SUBACK normal. Ahora readiness exige
+   exactamente un código concedido para events (`events_granted` en
+   `mqtt.rs`); un rechazo registra el aviso y reconecta para reintentar, y
+   el SUBACK de status nunca puede satisfacer readiness porque su
+   suscripción solo se solicita después del de events. Tres pruebas
+   unitarias cubren concedido / rechazado / malformado.
+   Aclaración: estos cambios NO son la causa del CI #23 (la evidencia
+   demuestra que la suscripción siempre fue concedida); son endurecimiento.
+2. **Suscripción sin reintento**: si `client.subscribe(events)` fallaba, se
+   registraba el error y el puente esperaba un SUBACK que nunca llegaría
+   (readiness colgada en 503). Ahora el fallo inicia reconexión con
+   retraso de 1 s.
+
+### Aislamiento real de entornos
+
+El smoke automatizado y el preview interactivo compartían antes el proyecto
+Docker `locker-rust-preview` y el puerto 8084: riesgo real de colisión y
+destrucción de datos interactivos. Separación aplicada sobre el mismo
+archivo Compose (el puerto publica `${LOCKER_PREVIEW_PORT:-8084}`):
+
+| Entorno | Proyecto | Puerto | Datos |
+|---|---|---|---|
+| Preview interactivo | `locker-rust-preview` | 8084 | persistentes |
+| Smoke automatizado | `locker-rust-preview-test` | 8085 (`LOCKER_PREVIEW_TEST_PORT`) | desechables |
+| Laboratorio Python | `locker` | 8083 | nunca tocado |
+
+Los volúmenes ya quedaban aislados por nombre de proyecto; la publicación
+del puerto era la colisión restante y ahora se propaga desde el script de
+smoke al Compose vía entorno del subproceso. `rust-preview.ps1` fija
+explícitamente 8084. El smoke, si detecta el preview interactivo corriendo,
+toma una instantánea de solo lectura (conteos de filas) y afirma al final
+que no cambió — verificado con datos reales (`1/24/3/0/0`). El modo E2E añade
+un tercer entorno desechable (`locker-rust-preview-guard`, puerto 8086)
+sembrado con un marcador de persistencia que debe sobrevivir al smoke
+completo.
+
+### Validación local como mecanismo principal
+
+`scripts/check-local.ps1` (invocable desde cualquier directorio):
+
+- **QUICK**: fmt/clippy/pruebas unitarias Rust en contenedor Linux
+  `rust:1-slim-bookworm` (volúmenes de caché para no re-descargar
+  dependencias), lint/build/vitest web (reutiliza `node_modules` solo si
+  los shims existen), y `git diff --check` de cambios staged y unstaged.
+- **FULL**: QUICK + integración Rust con PostgreSQL/Mosquitto desechables
+  en red privada, escenarios MQTT, comprobación de los tres archivos
+  Compose, smoke de la imagen Docker de Rust, checks Python (ruff/mypy/
+  pytest de API y simulador en `python:3.12-slim` con caché de pip),
+  paridad Python/Rust y regresión de reinicio del contenedor Python.
+- **E2E**: FULL + entorno guardián desechable con marcador de persistencia,
+  smoke completo del panel (login, préstamo y devolución simulados,
+  presencia, desconexión/reconexión, reinicio de broker y de backend
+  mid-operation, UNKNOWN/FAILED, conciliación y auditoría) y comprobación
+  de que el laboratorio 8083 y el preview interactivo 8084 quedan intactos.
+
+Cada paso reporta PASS/FAIL/SKIPPED con motivo y duración, la evidencia de
+fallos queda en `.local-validation/`, el exit code es no cero si algo falla
+y ningún modo toca datos del laboratorio ni del preview interactivo.
+
+### GitHub Actions opcional
+
+El workflow CI pasó a `workflow_dispatch` (manual desde la pestaña Actions)
+conservando sus ocho jobs completos; ningún push a main ejecuta CI
+automáticamente. Comprobación pendiente en GitHub (requiere permisos de
+administración, la API devuelve 401 anónima): verificar en Settings →
+Branches que `main` no exija checks obligatorios que ya no se disparan; el
+historial reciente de pushes directos a main sugiere que no los hay. El
+flujo documentado pasa a ser: OpenCode → validación local → revisión →
+commit en main → push opcional → CI remoto manual cuando se desee.
+
+### Inventario de dependencias Python (preparación Rust-only)
+
+| Componente | ¿Equivalente Rust? | Uso actual | Destino |
+|---|---|---|---|
+| FastAPI (`app/main.py`, `app/api/routes.py`) | Sí: auth, admin, inventario, autorizaciones, préstamos, devoluciones, operaciones, presencia, dashboard, auditoría y contratos de estado unificados | Backend activo del laboratorio 8083 | F4.4: retirar |
+| Puente MQTT (`app/modules/mqtt.py`) | Sí: puente Rust operativo, dueño exclusivo de `origin='rust'` | Activo en 8083 | F4.4: retirar |
+| Alembic (`app/db/migrations`, 5 versiones) | No | Único creador del esquema: laboratorio, preview interactivo y smoke (perfil `init`) | F4.3: baseline SQLx; F4.4: dueño único SQLx |
+| Seed LAB (`app/modules/seed.py`) | No | Inicialización explícita de toda base nueva | F4.4 |
+| Pruebas Python (`apps/api/tests`, 6 archivos) | Paridad cubierta por harness Rust + paridad de contrato | Calidad del backend activo | F4.4: retirar con el backend |
+| `scripts/test_phase2_parity.py` | n/a | Contrato compartido Python/Rust | Retirar en F4.4 |
+| `scripts/test_docker_restart.py` | n/a | Regresión de reinicio del backend Python | Retirar en F4.4 |
+| `compose.yaml` (perfil laboratorio) | Perfil `rust` existe pero opcional | Stack activo 8083 | F4.3: Rust como backend principal |
+| `compose.test.yaml` | n/a | Integración/reinicio Python | F4.4 |
+| Perfil `init` de `compose.rust-preview.yaml` | n/a | Alembic+seed vía imagen Python | F4.4: SQLx |
+| `apps/locker-simulator` | n/a | Simulación del hardware (no existe hardware físico) | **Conservar** mientras no haya hardware real |
+| `Dockerfile`/`Dockerfile.test` de apps/api | n/a | Imágenes Python | F4.4 |
+
+### Plan F4.2 / F4.3 / F4.4
+
+- **F4.2 — optimización enfocada en Rust**: paginación y carga por vista
+  (hallazgo #13) sobre la línea base de `docs/PERFORMANCE_BASELINE.md`,
+  unificación de convenciones del panel (hallazgo 2 de la revisión de
+  cierre F4.1) y medición comparada de CPU/memoria/latencia con la misma
+  carga, requisito del plan maestro antes de afirmar mejoras.
+- **F4.3 — Rust como backend principal del laboratorio**: el panel del
+  laboratorio apunta a api-rust con PostgreSQL persistente propio;
+  respaldo con `pg_dump`/restauración probados; reconciliación ya
+  disponible (UNKNOWN/resolve/auditoría); reversión documentada (volver el
+  nginx al backend Python sin tocar datos). Sin cutover de datos ni
+  reescritura del esquema.
+- **F4.4 — retirada de FastAPI**: migración Alembic→SQLx sobre bases
+  existentes mediante **baseline**: una migración SQLx inicial captura el
+  esquema en el head actual de Alembic; en una base existente se registra
+  como aplicada (fila en `_sqlx_migrations`) sin recrear nada, y en una
+  base nueva la misma migración crea el esquema completo — un artefacto
+  sirve a ambos casos. El historial Alembic se conserva en el repositorio
+  como registro histórico (read-only). Seed reimplementado (SQL idempotente
+  o subcomando Rust) rechazando bases no vacías. Retirar rutas, puente,
+  pruebas y Compose de Python; conservar el simulador. Ejecutar la paridad
+  Python/Rust completa antes de cada paso de retirada.
+
+### Validación F4.1-D
+
+- Causa raíz del CI #23: confirmada por reproducción y evidencia; corrección
+  nginx con regresión real (smoke completo pasa, incluido el reinicio
+  mid-operation que fallaba).
+- Rust: fmt ✔, clippy `-D warnings` ✔, 11 pruebas unitarias ✔ (3 nuevas de
+  SubAck), 29 pruebas de integración ignoradas ejecutadas en FULL.
+- Smoke del preview (proyecto `locker-rust-preview-test`, puerto 8085):
+  ciclo completo OK con datos del preview interactivo preservados
+  (`1/24/3/0/0`).
+- **QUICK: 8 PASS / 0 FAIL / 0 SKIPPED (84,8 s, exit 0).**
+- **FULL: 16 PASS / 0 FAIL / 0 SKIPPED (316,6 s, exit 0)** — incluye las
+  29 pruebas ignoradas contra PostgreSQL/Mosquitto desechables, 5 escenarios
+  MQTT, paridad completa de contratos (lectura, escritura y errores),
+  smoke de la imagen Docker, ruff/mypy/pytest de API y simulador, y la
+  regresión de reinicio del contenedor Python.
+- **E2E: 20 PASS / 0 FAIL / 0 SKIPPED (330,6 s, exit 0)** — FULL más
+  entorno guardián desechable (`locker-rust-preview-guard`, 8086) con
+  marcador de persistencia: `1/24/3/0/0/1` antes y después del smoke
+  completo; laboratorio 8083 con salud invariada (200) y datos nunca
+  tocados; preview interactivo 8084 operativo.
+- Dos defectos detectados por la propia validación y corregidos en el
+  mismo bloque: (1) el paso de integración ejecutaba cargo sin unir el
+  contenedor a la red de PostgreSQL/Mosquitto (`Name or service not
+  known`, 28 fallos idénticos); (2) el literal de array de PowerShell
+  dividía el SQL concatenado en argumentos sueltos y la verificación del
+  guardián era vacía (el marcador nunca se insertaba) — corregido con SQL
+  en un único argumento, `ON_ERROR_STOP=1` y rechazo explícito de conteos
+  vacíos para que un falso PASS de este tipo no pueda repetirse.
+- Riesgo conocido residual: `apps/web/nginx/default.conf` del laboratorio
+  Python mantiene el mismo patrón de upstream estático que rompía el CI
+  #23; solo se manifiesta si se reinicia la API Python en caliente sin
+  reiniciar su nginx. Fuera del alcance de este bloque (el laboratorio no
+  se toca); a considerar en F4.3 cuando Rust pase a ser el backend
+  principal del panel.

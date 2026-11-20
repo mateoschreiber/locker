@@ -9,7 +9,9 @@ agrega un backend Rust experimental e independiente con Axum, Tokio y SQLx.
 
 - Docker Desktop o Docker Engine con Compose y acceso a las imágenes necesarias.
 - Puerto TCP 8083 libre para el panel local. El perfil Rust opcional usa 18001.
-- Rust estable con `rustfmt` y `clippy` solo para compilar y probar fuera de Docker.
+- Node.js 22+ para las comprobaciones web locales. Rust y las herramientas de
+  Python se ejecutan dentro de contenedores Linux, por lo que no hace falta
+  ningún toolchain local: `scripts/check-local.ps1` se encarga de todo.
 
 ## Inicio rápido
 
@@ -225,18 +227,31 @@ nunca envía esa solicitud al backend conectado si no la anuncia.
 ## Entorno aislado Rust-preview (Fase 4.1)
 
 El panel React puede probarse completo contra el backend Rust sin tocar el
-laboratorio activo: proyecto, red, broker y volúmenes desechables propios
-(nada compartido con el stack principal; el broker aislado impide que los
-comandos lleguen al simulador del laboratorio). La base se inicializa
-explícitamente con el mismo esquema y seed del laboratorio, y el nginx del
-preview apunta a Rust mediante `apps/web/nginx/rust.conf` sin modificar la
-configuración productiva.
+laboratorio activo: proyecto, red, broker y volúmenes propios (nada compartido
+con el stack principal; el broker aislado impide que los comandos lleguen al
+simulador del laboratorio). La base se inicializa explícitamente con el mismo
+esquema y seed del laboratorio, y el nginx del preview apunta a Rust mediante
+`apps/web/nginx/rust.conf` sin modificar la configuración productiva. Ese
+nginx resuelve el nombre `api-rust` en cada petición (DNS embebido de Docker,
+`resolver 127.0.0.11`): un reinicio del backend le asigna otra IP de red y
+una resolución estática cacheada dejaría el proxy marcando la IP muerta para
+siempre (fallo real del CI #23, ver Plan Maestro).
+
+El archivo Compose publica el puerto con la variable `LOCKER_PREVIEW_PORT`
+(por defecto 8084), por lo que el mismo archivo sirve a los dos entornos sin
+duplicación ni riesgo mutuo:
+
+| Entorno | Proyecto Compose | Puerto | Datos |
+|---|---|---|---|
+| Preview interactivo | `locker-rust-preview` | 8084 | persistentes entre start/stop |
+| Smoke automatizado | `locker-rust-preview-test` | 8085 (`LOCKER_PREVIEW_TEST_PORT`) | desechables (`down -v` solo de este proyecto) |
+| Laboratorio Python | `locker` | 8083 | nunca tocado por ninguno de los dos |
 
 ### Uso interactivo (Windows)
 
 `scripts/rust-preview.ps1` gestiona el preview desde cualquier directorio de
-PowerShell; el laboratorio Python (puerto 8083) permanece independiente e
-intacto:
+PowerShell; fija el proyecto `locker-rust-preview` y el puerto 8084, y el
+laboratorio Python (8083) permanece independiente e intacto:
 
 ```powershell
 .\scripts\rust-preview.ps1 start    # levanta y espera readiness; inicializa
@@ -267,15 +282,56 @@ operación— se valida con:
 python scripts/test_rust_preview.py
 ```
 
-Ese smoke mantiene su ciclo de vida desechable propio (`down -v`) y no
-interfiere con el uso interactivo; `LOCKER_PREVIEW_KEEP=1` lo conserva
-levanto para depuración. TTL de confirmación corto
-(`RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5`) para que los escenarios inciertos
-sean conciliables rápidamente.
+El smoke corre bajo su propio proyecto `locker-rust-preview-test` en el
+puerto 8085 (`LOCKER_PREVIEW_TEST_PORT`) y solo destruye ese proyecto; si el
+preview interactivo está corriendo, toma una instantánea de solo lectura de
+sus datos y afirma al final que quedaron intactos. Ante cualquier fallo
+captura evidencia diagnóstica (contenedores, registros de api-rust,
+postgres, mosquitto y nginx, y el modo de fallo de `health/live` y
+`health/ready`: 502/503/timeout/rechazo) en `.local-validation/` **antes**
+del desmonte desechable, para poder diagnosticar a posteriori.
+`LOCKER_PREVIEW_KEEP=1` conserva el entorno levantado para depuración. TTL
+de confirmación corto (`RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5`) para que los
+escenarios inciertos sean conciliables rápidamente.
+
+## Validación local (Fase 4.1-D)
+
+La validación principal del repositorio es local y reproducible; GitHub
+Actions queda como comprobación adicional bajo demanda. Desde cualquier
+directorio de PowerShell:
+
+```powershell
+.\scripts\check-local.ps1            # QUICK (default): fmt, clippy, pruebas
+                                      # unitarias Rust (contenedor Linux),
+                                      # lint/build/test web, diff staged+unstaged
+.\scripts\check-local.ps1 FULL       # QUICK + integración Rust con PostgreSQL
+                                      # y Mosquitto desechables, escenarios MQTT,
+                                      # config Compose, smoke de imagen, checks
+                                      # Python (ruff/mypy/pytest), paridad y
+                                      # regresión de reinicio
+.\scripts\check-local.ps1 E2E        # FULL + preview guardián desechable con
+                                      # marcador de persistencia, smoke completo
+                                      # (login, préstamos, presencia, reinicios,
+                                      # UNKNOWN/FAILED, conciliación) y
+                                      # verificación de que el laboratorio 8083
+                                      # y el preview interactivo quedan intactos
+```
+
+Cada paso reporta PASS, FAIL o SKIPPED con su motivo, se registra la duración,
+la evidencia de fallos queda en `.local-validation/`, el código de salida es
+no cero si algo falla, y las dependencias Rust/Python se cachean en volúmenes
+Docker para no reinstalarlas en cada corrida. Ningún modo toca los datos del
+laboratorio (8083), del preview interactivo (8084) ni de sus volúmenes.
 
 ## Desarrollo
 
-Ejecute las validaciones desde cada aplicación:
+El flujo de trabajo es: desarrollar con OpenCode → ejecutar la validación
+local (`scripts/check-local.ps1`) → revisión → commit en `main` → push
+opcional → CI remoto manual desde la pestaña Actions cuando se desee una
+comprobación completa (el workflow es `workflow_dispatch`; ningún push
+ejecuta los jobs automáticamente).
+
+Las comprobaciones equivalentes por aplicación, dentro o fuera de contenedores:
 
 ```bash
 cd apps/api && pip install -e '.[dev]' && ruff check . && mypy app && pytest
@@ -288,8 +344,15 @@ La prueba Rust con PostgreSQL se ejecuta explícitamente con
 `LOCKER_TEST_DATABASE_URL` apuntando a una base aislada y
 `cargo test --locked -- --ignored`; cubre salud y las 8 pruebas del dominio
 (auth/admin, colocaciones, autorizaciones, checkout idempotente, concurrencia
-de retiros y de devoluciones, devoluciones y dashboard). CI proporciona esa base; sin ella la prueba
+de retiros y de devoluciones, devoluciones y dashboard). `check-local.ps1
+FULL` levanta esa base y su broker automáticamente; sin ella la prueba
 aparece como ignorada, no como validación de conexión.
+
+**Reglas de rama:** si `main` tuviera checks obligatorios configurados en
+GitHub (Settings → Branches), deben retirarse o actualizarse al pasar CI a
+ejecución manual; de lo contrario un push quedaría esperando checks que ya
+no se disparan automáticamente. Sin permisos de administración no se puede
+consultar esa configuración desde aquí; verifíquela una vez en GitHub.
 
 Consulte [CONTRIBUTING.md](CONTRIBUTING.md) antes de enviar cambios y
 [SECURITY.md](SECURITY.md) para reportes de seguridad.

@@ -1,9 +1,10 @@
 name: CI
 
+# Manual-only (F4.1-D): local validation (scripts/check-local.ps1) is the
+# primary gate; this workflow stays available on demand from the Actions tab
+# for a full remote verification. Nothing runs automatically on push.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   rust:

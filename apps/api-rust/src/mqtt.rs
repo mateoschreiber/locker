@@ -18,7 +18,7 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, SubAck, SubscribeReasonCode};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{postgres::PgRow, query, query_scalar, PgPool, Row};
@@ -51,6 +51,23 @@ struct CompartmentEvent {
     correlation_id: String,
     locker_id: String,
     compartment_id: String,
+}
+
+/// True when every return code in the SUBACK is a granted QoS: MQTT 3.1.1
+/// signals a rejected subscription with 0x80 inside an otherwise normal
+/// SUBACK, so the packet alone does not prove the subscription exists.
+fn codes_granted(suback: &SubAck) -> bool {
+    suback
+        .return_codes
+        .iter()
+        .all(|code| matches!(code, SubscribeReasonCode::Success(_)))
+}
+
+/// The events subscription is a single filter: readiness requires exactly
+/// one granted code. Empty or multi-code SUBACKs cannot be tied to that one
+/// filter and must never satisfy readiness.
+fn events_granted(suback: &SubAck) -> bool {
+    suback.return_codes.len() == 1 && codes_granted(suback)
 }
 
 /// Starts the bridge background task. `subscribed` reflects the events
@@ -89,23 +106,43 @@ async fn run_bridge(
         subscribed.store(false, Ordering::Relaxed);
         let (client, mut eventloop) = AsyncClient::new(options.clone(), 16);
         if let Err(error) = client.subscribe(EVENTS_FILTER, QoS::AtLeastOnce).await {
+            // Without the request queued there is no SUBACK to wait for;
+            // retry on a fresh connection instead of polling forever with
+            // readiness stuck on 503.
             tracing::error!(?error, "mqtt_subscribe_request_failed");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         }
         let mut in_flight: Option<InFlight> = None;
         let mut next_sweep = Instant::now() + SWEEP_INTERVAL;
         loop {
             let polled = tokio::time::timeout(POLL, eventloop.poll()).await;
             match polled {
-                Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
-                    // Readiness belongs to the events subscription alone: the
-                    // status subscription is only requested after the events
-                    // SUBACK, so it can never satisfy readiness on its own.
-                    if !subscribed.swap(true, Ordering::Relaxed) {
-                        tracing::info!("mqtt_events_subscribed");
-                        if let Err(error) = client.subscribe(STATUS_FILTER, QoS::AtLeastOnce).await
-                        {
-                            tracing::warn!(?error, "mqtt_status_subscribe_request_failed");
+                Ok(Ok(Event::Incoming(Packet::SubAck(suback)))) => {
+                    if !subscribed.load(Ordering::Relaxed) {
+                        // First SUBACK on this connection is the events
+                        // subscription (status is only requested afterwards),
+                        // so only a granted code can satisfy readiness; a
+                        // broker rejection (0x80) reconnects and retries.
+                        if events_granted(&suback) {
+                            subscribed.store(true, Ordering::Relaxed);
+                            tracing::info!("mqtt_events_subscribed");
+                            if let Err(error) =
+                                client.subscribe(STATUS_FILTER, QoS::AtLeastOnce).await
+                            {
+                                tracing::warn!(?error, "mqtt_status_subscribe_request_failed");
+                            }
+                        } else {
+                            tracing::warn!("mqtt_events_subscription_rejected");
+                            // Nothing was published before readiness (the
+                            // claim loop gates on `subscribed`), so there is
+                            // no in-flight operation to reconcile here.
+                            break;
                         }
+                    } else if !codes_granted(&suback) {
+                        // Status never gates readiness; a rejection only
+                        // degrades presence until the next reconnect.
+                        tracing::warn!("mqtt_status_subscription_rejected");
                     }
                 }
                 Ok(Ok(Event::Incoming(Packet::PubAck(_)))) => {
@@ -581,4 +618,48 @@ async fn mark_failed(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_suback_with_one_granted_code_satisfies_readiness() {
+        let suback = SubAck {
+            pkid: 1,
+            return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+        };
+        assert!(events_granted(&suback));
+    }
+
+    #[test]
+    fn rejected_events_suback_never_satisfies_readiness() {
+        // MQTT 3.1.1 rejection: 0x80 arrives in an otherwise normal SUBACK,
+        // which the old code treated as subscribed -> false readiness.
+        let suback = SubAck {
+            pkid: 1,
+            return_codes: vec![SubscribeReasonCode::Failure],
+        };
+        assert!(!events_granted(&suback));
+    }
+
+    #[test]
+    fn malformed_events_suback_never_satisfies_readiness() {
+        // Empty or multi-code SUBACKs cannot be tied to the single events
+        // filter; treating them as granted would fake readiness.
+        let empty = SubAck {
+            pkid: 1,
+            return_codes: vec![],
+        };
+        let doubled = SubAck {
+            pkid: 1,
+            return_codes: vec![
+                SubscribeReasonCode::Success(QoS::AtLeastOnce),
+                SubscribeReasonCode::Failure,
+            ],
+        };
+        assert!(!events_granted(&empty));
+        assert!(!events_granted(&doubled));
+    }
 }
