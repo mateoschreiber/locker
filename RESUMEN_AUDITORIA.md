@@ -4,6 +4,8 @@ Fecha: 19 de noviembre de 2026. Revisión del repositorio en el commit
 `656d31a` (cierre de la Fase 3 de la migración a Rust). Este resumen actualiza
 la auditoría original (commit `cb558b3`) conservando la numeración de
 hallazgos, que el Plan Maestro y la documentación referencian.
+Actualización F4.0 (20-11-2026): #2-dump, #14, #19, #22
+y #23 cerrados; ver "Avance de Fase 4.0" en el Plan Maestro.
 
 ## Diagnóstico
 
@@ -45,7 +47,7 @@ Navegador → Nginx y React → FastAPI (activo) → PostgreSQL (lab)
 | Nº | Prioridad | Hallazgo | Estado (19-11-2026) | Evidencia actual |
 |---:|:---:|---|---|---|
 | 1 | P0 | Rutas sin sesión ni permisos; token fijo. | **Pendiente (F5).** Rust exige `Bearer lab-admin-token` solo en `/operations/{id}/resolve`; todo lo demás sigue abierto en ambos backends. | [login](apps/api/app/modules/routes.py#L77), [resolve](apps/api-rust/src/operations.rs#L378) |
-| 2 | P0 | Contraseñas en texto claro y expuestas en respuestas. | **Parcial.** Rust nunca serializa `password`; **Python todavía la devuelve en cada respuesta de usuario, incluido el login** (2 líneas lo corrigen: excluir la columna en `dump`). El almacenamiento en claro y la ausencia de HTTPS siguen hasta F5. | [dump](apps/api/app/modules/routes.py#L36), [fix Rust](apps/api-rust/src/dump.rs#L13) |
+| 2 | P0 | Contraseñas en texto claro y expuestas en respuestas. | **Dump cerrado (F4.0).** Ningún backend serializa `password` (login, `/auth/me`, listados, detalle, CRUD), con prueba en la suite aislada. El almacenamiento en claro y la ausencia de HTTPS siguen hasta F5. | [dump](apps/api/app/modules/routes.py#L36), [fix Rust](apps/api-rust/src/dump.rs#L13) |
 | 3 | P0 | MQTT anónimo, sin identidad de dispositivo ni TLS. | **Pendiente (F5).** `allow_anonymous true`; el protocolo exige al hardware futuro deduplicación persistente y rechazo de correlaciones desconocidas. | [mosquitto.conf](infra/docker/mosquitto.conf#L3), [protocolo](docs/hardware/HARDWARE_PROTOCOL.md) |
 | 4 | P0 | Seed automático en cada arranque. | **Resuelto (F0).** El seed es explícito, rechaza bases no vacías y el arranque no lo ejecuta. | [seed](apps/api/app/modules/seed.py#L21), [Dockerfile CMD](apps/api/Dockerfile) |
 | 5 | P0 | Una apertura simulada no demuestra entrega. | **Mantenido por diseño, endurecido (F3).** PUBACK≠física documentado; `UNKNOWN` y conciliación separan lo incierto; la evidencia física es F5. | [protocolo](docs/hardware/HARDWARE_PROTOCOL.md#ciclo-de-vida-de-una-operación-fase-3) |
@@ -57,19 +59,21 @@ Navegador → Nginx y React → FastAPI (activo) → PostgreSQL (lab)
 | 11 | P1 | CRUD genérico sin validación de contratos. | **Resuelto en Rust (F2).** Campos, tipos, longitudes, UUID, FK→422, duplicado→409. Python conserva el 500 en payloads inválidos hasta F4. **Véase #19: el valor de `status` sigue siendo texto libre.** | [entities](apps/api-rust/src/entities.rs#L1) |
 | 12 | P1 | Identidad MQTT compartida y consumidor duplicado. | **Resuelto en Rust (F3).** `client_id` propio + partición por `origin` y estados, probado en coexistencia sobre una base compartida. Python mantiene el `client_id` fijo (réplicas Python seguirían expulsándose). | [coexistencia](scripts/test_rust_mqtt.py), [puente](apps/api-rust/src/mqtt.rs#L40) |
 | 13 | P2 | 14 colecciones por ciclo, dashboard cada 4 s, sin paginación. | **Pendiente (F4).** | [panel](apps/web/src/App.tsx#L43) |
-| 14 | P2 | Historial puede incluir ubicaciones de otros activos. | **Parcial.** El filtro por `tool_id` existe, pero conserva una condición muerta (`active.get(selected.id)?.tool_id === selected.id` es siempre cierta si el registro existe); falta la prueba con dos activos. | [filtro](apps/web/src/App.tsx#L76) |
+| 14 | P2 | Historial puede incluir ubicaciones de otros activos. | **Resuelto (F4.0).** El panel consulta `GET /tools/{id}/history` por selección con `AbortController`; una respuesta tardía de otra herramienta no sobrescribe la visible (prueba con orden de respuestas invertido). | [filtro](apps/web/src/App.tsx#L81), [prueba](apps/web/src/App.test.tsx) |
 | 15 | P2 | Presencia mostrada sin consumir latidos. | **Pendiente (F4).** El simulador publica `LOCKER_HEARTBEAT`; nadie lo consume. | [simulador](apps/locker-simulator/locker_simulator/__main__.py#L24) |
 | 16 | P2 | Falta de pruebas de flujos críticos. | **Muy avanzado.** Suites aisladas PostgreSQL/Mosquitto (Rust 19/19, Python 9/9, simulador 7/7), migraciones, paridad de contratos, escenarios Docker de reinicio y caída, CI con 8 jobs. Faltan pruebas de permisos (F5) y de interfaz profunda. | [ci.yml](.github/workflows/ci.yml) |
-| 17 | P2 | Fallos sin vía de recuperación del préstamo. | **Resuelto en Rust (F3/3.6).** `FAILED`/`UNKNOWN` con conciliación auditable que revierte el préstamo; eventos tardíos con reglas definidas. Python sin conciliación hasta F4. | [resolve](apps/api-rust/src/operations.rs#L378) |
+| 17 | P2 | Fallos sin vía de recuperación del préstamo. | **Resuelto en Rust (F3/3.6 + F4.0).** `UNKNOWN` conciliable; un `FAILED` que aún retiene un préstamo pendiente también (`resolve` exige atestación; la reversión nunca es automática cuando la apertura pudo ejecutarse). Fallo de publicación sin entrega (p. ej. código ambiguo) revierte en la misma transacción. Python sin conciliación hasta F4. | [resolve](apps/api-rust/src/operations.rs#L375), [puente](apps/api-rust/src/mqtt.rs#L281) |
 | 18 | P3 | Esquemas sin uso (12 clases). | **Pendiente (F4).** Se retiran junto con Python. | [schemas](apps/api/app/modules/schemas.py) |
 
 ## Hallazgos nuevos (revisión 19-11-2026)
 
 | Nº | Prioridad | Hallazgo | Acción recomendada | Evidencia |
 |---:|:---:|---|---|---|
-| 19 | P1 | **El estado de cualquier entidad administrada es texto libre**: `PATCH /{entity}/{id}` acepta cualquier cadena ≤32 caracteres en ambos backends, y el panel lo invita con un `prompt()` de "Estado nuevo". Un estado como `BANANA` saca la herramienta de todos los filtros y del dashboard sin ninguna transición de dominio. | Validar contra la lista de estados permitidos por entidad (422 en caso inválido) y una prueba de contrato; el panel debería ofrecer la lista, no texto libre. | [spec de estado](apps/api-rust/src/entities.rs#L65), [panel](apps/web/src/App.tsx#L79) |
+| 19 | P1 | **El estado de cualquier entidad administrada es texto libre**: `PATCH /{entity}/{id}` acepta cualquier cadena ≤32 caracteres en ambos backends, y el panel lo invita con un `prompt()` de "Estado nuevo". Un estado como `BANANA` saca la herramienta de todos los filtros y del dashboard sin ninguna transición de dominio. | **Resuelto (F4.0).** Lista administrativa por entidad validada en ambos backends (422 idéntico, paridad verificada); estados de dominio (`ON_LOAN`, préstamos, operaciones) no editables; guardias 409 con bloqueo transaccional (herramienta con préstamo activo/pendiente, compartimento con ubicación o devolución pendiente) aplicadas también a `deactivate`; el panel ofrece la lista, no texto libre. | [spec](apps/api-rust/src/entities.rs#L75), [guardias](apps/api-rust/src/admin.rs#L57), [panel](apps/web/src/App.tsx#L103) |
 | 20 | P2 | El puente Rust, contra una base sin esquema (perfil de laboratorio), emite un error de reclamo cada 250 ms de forma indefinida. Inofensivo pero ruidoso. | Retroceso exponencial o silencio para el error `42P01` del reclamo; el laboratorio del perfil `rust` no crea esquema automáticamente. | [reclamo](apps/api-rust/src/mqtt.rs#L159) |
 | 21 | P3 | Tres jobs de CI (`compose`, `parity`, `mqtt`) reconstruyen las mismas imágenes Docker en cada ejecución. | Compartir artefactos o consolidar los escenarios; hoy es solo tiempo de CI, sin efecto funcional. | [ci.yml](.github/workflows/ci.yml#L84) |
+| 22 | P1 | **Fallo de confirmación por evento dejaba el préstamo atrapado** (detectado en revisión de F4.0): compartimento ocupado, ubicación desaparecida o evento ajeno terminaban la operación `FAILED` sin revertir el préstamo, y `resolve` solo aceptaba `UNKNOWN`. | **Resuelto (F4.0).** La apertura pudo ejecutarse, así que nunca se libera automáticamente: `resolve` acepta el `FAILED` mientras retenga préstamo pendiente (atestación auditable, terminal idempotente); el fallo de publicación sin entrega (código ambiguo) revierte en la misma transacción con `revert_pending_loan`. Pruebas por broker y directo. | [puente](apps/api-rust/src/mqtt.rs#L281), [resolve](apps/api-rust/src/operations.rs#L375) |
+| 23 | P2 | **`create_placement` solo reservaba contra RETURN `PENDING`** (detectado en revisión de F4.0): el puente Rust pasa la operación a `PUBLISHING` en ~250 ms, abriendo una ventana para ubicar otra herramienta en el compartimento reservado. | **Resuelto (F4.0).** Misma lista de estados que `return_loan` (`PENDING/PUBLISHING/PUBLISHED/UNKNOWN`); la confirmación MQTT bloquea la fila del compartimento (`FOR UPDATE`) como los escritores REST. Prueba por estado y de concurrencia colocación/devolución. | [reserva](apps/api-rust/src/inventory.rs#L129), [confirmación](apps/api-rust/src/mqtt.rs#L477) |
 
 ## Hardware y operación
 
@@ -101,16 +105,18 @@ pruebas de coexistencia.
 
 ## Orden recomendado (actualizado)
 
-1. Cerrar #19 (estados permitidos) y el volcado de contraseñas en Python
-   (2 líneas, parte de #2) — pequeños y anteriores a cualquier Fase 4.
+1. ~~Cerrar #19 (estados permitidos) y el volcado de contraseñas en Python
+   (parte de #2)~~ — hecho en F4.0, junto con #14, #22 y #23 (ver
+   "Avance de Fase 4.0" en el Plan Maestro).
 2. ~~Validar CI remoto de la Fase 3~~ — hecho: run #18 sobre `37026b0`,
    8/8 jobs aprobados.
-3. Fase 4: latidos y presencia (#15), panel de conciliación, paginación y
-   carga por vista (#13, #14), medición de recursos, cutover y retirada de
-   Python (#6, #17, #18 se cierran solos al retirarlo).
-4. Fase 5: autenticación y permisos (#1), hashes y HTTPS (#2), MQTT con TLS e
-   identidad por dispositivo (#3), evidencia física (#5) y plan de credenciales
-   de producción separado del laboratorio.
+3. Fase 4.1: latidos y presencia (#15), panel de conciliación y estados de
+   operación visibles; F4.2: paginación y carga por vista (#13) sobre la
+   línea base de `docs/PERFORMANCE_BASELINE.md`, medición comparada, cutover
+   y retirada de Python (#6, #17-python y #18 se cierran al retirarlo).
+4. Fase 5: autenticación y permisos (#1), hashes y HTTPS (#2 resto), MQTT con
+   TLS e identidad por dispositivo (#3), evidencia física (#5) y plan de
+   credenciales de producción separado del laboratorio.
 
 ## Alcance y límites de la verificación
 

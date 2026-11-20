@@ -1,7 +1,7 @@
 use axum::{http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::{postgres::PgRow, query, PgPool, Postgres, QueryBuilder, Row};
+use sqlx::{postgres::PgRow, query, query_scalar, PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 use crate::audit::{admin_actor, audit};
@@ -51,6 +51,85 @@ pub async fn list(
     Ok(Json(Value::Array(rows.iter().map(dump_row).collect())))
 }
 
+/// Validates a manually written status against the entity's allowed list
+/// (audit #19): unknown or domain-only states are a 422 contract error.
+fn check_status(spec: &Entity, value: &Val) -> Result<(), ApiError> {
+    let Val::Text(value) = value else {
+        return Ok(());
+    };
+    if !spec.allowed_statuses.is_empty() && !spec.allowed_statuses.contains(&value.as_str()) {
+        return Err(ApiError::validation(&format!(
+            "Campo 'status': debe ser uno de {}",
+            spec.allowed_statuses.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Domain guards for a manual status write (PATCH or deactivate, audit #19):
+/// a tool with a pending/active loan and a compartment holding an active
+/// placement or a pending-return reservation keep their state until the
+/// domain releases it. Row locks (`FOR UPDATE`) serialize against the
+/// checkout/return/confirmation flows, which take the same locks.
+async fn guard_status_change(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    spec: &'static Entity,
+    item_id: Uuid,
+) -> Result<(), ApiError> {
+    match spec.path {
+        "tools" => {
+            query("SELECT id FROM tools WHERE id = $1 FOR UPDATE")
+                .bind(item_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            let active_loan: Option<Uuid> = query_scalar(
+                "SELECT id FROM loans WHERE tool_id = $1
+                  AND status IN ('CHECKOUT_PENDING','ACTIVE','RETURN_PENDING')",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if active_loan.is_some() {
+                return Err(ApiError::conflict(
+                    "La herramienta tiene un préstamo activo o pendiente",
+                ));
+            }
+        }
+        "compartments" => {
+            query("SELECT id FROM compartments WHERE id = $1 FOR UPDATE")
+                .bind(item_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            let blocked: Option<Uuid> = query_scalar(
+                "SELECT id FROM tool_placements WHERE compartment_id = $1 AND removed_at IS NULL",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let blocked = match blocked {
+                Some(id) => Some(id),
+                None => {
+                    query_scalar(
+                        "SELECT id FROM locker_operations WHERE compartment_id = $1
+                       AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN')
+                       AND command_type = 'RETURN'",
+                    )
+                    .bind(item_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                }
+            };
+            if blocked.is_some() {
+                return Err(ApiError::conflict(
+                    "El compartimiento tiene una ubicación activa o una devolución pendiente",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// GET /{entity}/{item_id}
 pub async fn get_one(
     spec: &'static Entity,
@@ -79,6 +158,9 @@ pub async fn create(
     for field in spec.fields {
         match field_value(field, &payload)? {
             Some(value) => {
+                if field.name == "status" {
+                    check_status(spec, &value)?;
+                }
                 columns.push(field.name);
                 values.push(value);
             }
@@ -149,11 +231,20 @@ pub async fn update(
     for field in spec.fields {
         if field.editable {
             if let Some(value) = field_value(field, &payload)? {
+                if field.name == "status" {
+                    check_status(spec, &value)?;
+                }
                 updates.push((field.name, value));
             }
         }
     }
     let mut tx = pool.begin().await?;
+    if updates.iter().any(|(column, _)| *column == "status") {
+        // 404 before the guard, keeping the not-found contract; the guard
+        // then refuses writes that contradict active domain state.
+        fetch_row(&mut tx, spec, item_id).await?;
+        guard_status_change(&mut tx, spec, item_id).await?;
+    }
     let row: PgRow = if updates.is_empty() {
         fetch_row(&mut tx, spec, item_id).await?
     } else {
@@ -211,6 +302,9 @@ pub async fn deactivate(
     if !spec.has_status {
         return Err(ApiError::conflict("La entidad no admite desactivación"));
     }
+    // Deactivation is a status write: the same domain guards as PATCH apply,
+    // so `deactivate` cannot bypass them (audit #19).
+    guard_status_change(&mut tx, spec, item_id).await?;
     let row: PgRow = query(&format!(
         "UPDATE {} SET status = 'INACTIVE' WHERE id = $1 RETURNING *",
         spec.table

@@ -173,3 +173,90 @@ def test_simulated_loan_and_restart() -> None:
         connection.exec_driver_sql('SET TRANSACTION READ ONLY')
         findings = dict(connection.exec_driver_sql(statements[1]).all())
         assert all(count == 0 for count in findings.values())
+
+
+def test_status_contract_password_exclusion_and_guards() -> None:
+    from uuid import uuid4
+
+    from app.db.session import SessionLocal
+    from app.main import app
+    from app.modules.models import Loan, LockerOperation
+
+    with TestClient(app) as client:
+        # #2: no user payload ever exposes the password column.
+        response = client.post('/api/v1/auth/login', json={
+            'username': 'admin', 'password': 'admin'})
+        assert response.status_code == 200
+        assert 'password' not in response.json()['user']
+        users = client.get('/api/v1/users').json()
+        assert users and all('password' not in user for user in users)
+        admin = users[0]
+        assert 'password' not in client.get(f"/api/v1/users/{admin['id']}").json()
+        created = client.post('/api/v1/users', json={
+            'username': f'auditor-{uuid4().hex[:8]}', 'display_name': 'Auditor'})
+        assert created.status_code == 201
+        assert 'password' not in created.json()
+        patched = client.patch(
+            f"/api/v1/users/{created.json()['id']}", json={'status': 'INACTIVE'})
+        assert patched.status_code == 200
+        assert 'password' not in patched.json()
+
+        # #19: unknown states are rejected and leave the row untouched.
+        branch = client.get('/api/v1/branches').json()[0]
+        rejected = client.patch(f"/api/v1/branches/{branch['id']}", json={'status': 'BANANA'})
+        assert rejected.status_code == 422
+        assert rejected.json()['detail'] == "Campo 'status': debe ser uno de ACTIVE, INACTIVE"
+        assert client.get(f"/api/v1/branches/{branch['id']}").json()['status'] == branch['status']
+
+        locker = client.get('/api/v1/lockers').json()[0]
+        rejected = client.patch(f"/api/v1/lockers/{locker['id']}", json={'status': 'ACTIVE'})
+        assert rejected.status_code == 422
+        assert rejected.json()['detail'] == "Campo 'status': debe ser uno de ONLINE, INACTIVE"
+
+        # ON_LOAN is domain-only: never administratively creatable.
+        rejected = client.post('/api/v1/tools', json={
+            'asset_code': f'TOOL-{uuid4().hex[:8]}', 'name': 'X', 'status': 'ON_LOAN'})
+        assert rejected.status_code == 422
+
+        # Guards: a tool with an in-flight loan keeps its state.
+        tool = next(t for t in client.get('/api/v1/tools').json()
+                    if t['status'] == 'AVAILABLE')
+        with SessionLocal() as session:
+            session.add(Loan(tool_id=tool['id'], user_id=admin['id'], status='CHECKOUT_PENDING'))
+            session.commit()
+        conflict = client.patch(f"/api/v1/tools/{tool['id']}", json={'status': 'INACTIVE'})
+        assert conflict.status_code == 409
+        assert conflict.json()['detail'] == 'La herramienta tiene un préstamo activo o pendiente'
+        assert client.post(f"/api/v1/tools/{tool['id']}/deactivate").status_code == 409
+        assert client.get(f"/api/v1/tools/{tool['id']}").json()['status'] == 'AVAILABLE'
+        # Only status is guarded: other fields stay editable.
+        renamed = client.patch(f"/api/v1/tools/{tool['id']}", json={'name': 'Renombrada'})
+        assert renamed.status_code == 200
+
+        # A compartment holding a placement refuses manual deactivation.
+        compartment = client.get('/api/v1/compartments').json()[0]
+        conflict = client.post(f"/api/v1/compartments/{compartment['id']}/deactivate")
+        assert conflict.status_code == 409
+        assert conflict.json()['detail'] == (
+            'El compartimiento tiene una ubicación activa o una devolución pendiente')
+
+        # A free compartment reserved by a pending RETURN refuses too.
+        free = client.post('/api/v1/compartments', json={
+            'locker_id': locker['id'], 'code': f'C-{uuid4().hex[:6]}',
+            'name': 'Reservada', 'position': 999})
+        assert free.status_code == 201
+        free = free.json()
+        with SessionLocal() as session:
+            loan = Loan(tool_id=tool['id'], user_id=admin['id'], status='ACTIVE')
+            session.add(loan)
+            session.flush()
+            session.add(LockerOperation(
+                correlation_id=str(uuid4()), command_type='RETURN', status='PENDING',
+                tool_id=tool['id'], loan_id=loan.id,
+                branch_id=branch['id'], locker_id=locker['id'],
+                compartment_id=free['id']))
+            session.commit()
+        conflict = client.post(f"/api/v1/compartments/{free['id']}/deactivate")
+        assert conflict.status_code == 409
+        conflict = client.patch(f"/api/v1/compartments/{free['id']}", json={'status': 'INACTIVE'})
+        assert conflict.status_code == 409

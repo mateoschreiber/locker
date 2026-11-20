@@ -249,7 +249,26 @@ def main():
                      f"/api/v1/loans/{uuid4()}/return")
         read_parity(python_base, rust_base, 'after return')
 
-        # 6. Parity of the detail endpoints after the flow.
+        # 6. F4.0 status contract (#19): identical 422/409 on both backends.
+        error_parity(python_base, rust_base, 'unknown status', 'PATCH',
+                     f"/api/v1/branches/{branch['id']}", {'status': 'BANANA'}, expected=422)
+        error_parity(python_base, rust_base, 'locker administrative states', 'PATCH',
+                     f"/api/v1/lockers/{locker['id']}", {'status': 'ACTIVE'}, expected=422)
+        error_parity(python_base, rust_base, 'domain-only tool status', 'POST',
+                     '/api/v1/tools',
+                     {'asset_code': f'TOOL-{uuid4().hex[:8]}', 'name': 'Paridad',
+                      'status': 'ON_LOAN'}, expected=422)
+        # The tool has an in-flight loan: manual writes are refused in both.
+        error_parity(python_base, rust_base, 'tool with in-flight loan', 'PATCH',
+                     f"/api/v1/tools/{tool['id']}", {'status': 'INACTIVE'})
+        error_parity(python_base, rust_base, 'deactivate tool with in-flight loan', 'POST',
+                     f"/api/v1/tools/{tool['id']}/deactivate")
+        # A compartment holding a placement refuses manual deactivation.
+        _, compartments = http('GET', rust_base + '/api/v1/compartments')
+        error_parity(python_base, rust_base, 'compartment with placement', 'POST',
+                     f"/api/v1/compartments/{compartments[0]['id']}/deactivate")
+
+        # 7. Parity of the detail endpoints after the flow.
         _, python_detail = http('GET', python_base + f"/api/v1/lockers/{locker['id']}/detail")
         _, rust_detail = http('GET', rust_base + f"/api/v1/lockers/{locker['id']}/detail")
         compare('locker detail', python_detail, rust_detail)

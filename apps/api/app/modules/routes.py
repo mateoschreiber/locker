@@ -36,6 +36,8 @@ class AuditableEntity(Protocol):
 def dump(item: object) -> dict[str, object]:
     result: dict[str, object] = {}
     for column in item.__table__.columns:  # type: ignore[attr-defined]
+        if column.name == "password":  # credentials never leave the API (#2)
+            continue
         value = getattr(item, column.name)
         if isinstance(value, UUID):
             result[column.name] = str(value)
@@ -92,6 +94,71 @@ def current_user(session: Session = Depends(get_db)) -> dict[str, object]:
     return dump(user)
 
 
+# Administrative states an admin may write, per entity (#19). Domain-only
+# states (tools ON_LOAN, loans, operations) never appear here and are
+# rejected with 422 in both backends with the same message. Tuple order
+# matches the Rust lists so the error messages are identical.
+ALLOWED_STATUSES: dict[str, tuple[str, ...]] = {
+    "/branches": ("ACTIVE", "INACTIVE"),
+    "/roles": (),
+    "/users": ("ACTIVE", "INACTIVE"),
+    "/memberships": ("ACTIVE", "INACTIVE"),
+    "/lockers": ("ONLINE", "INACTIVE"),
+    "/compartments": ("ACTIVE", "INACTIVE"),
+    "/locks": ("LOCKED", "INACTIVE"),
+    "/cameras": ("SIMULATED", "INACTIVE"),
+    "/tools": ("AVAILABLE", "INACTIVE"),
+}
+
+# In-flight states of a RETURN that keep its compartment reserved (F2).
+RESERVED_RETURN_STATUSES = ("PENDING", "PUBLISHING", "PUBLISHED", "UNKNOWN")
+
+
+def check_status(path: str, value: object) -> None:
+    allowed = ALLOWED_STATUSES.get(path, ())
+    if allowed and value not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Campo 'status': debe ser uno de {', '.join(allowed)}",
+        )
+
+
+def guard_status_change(session: Session, path: str, item_id: UUID) -> None:
+    """Domain guards for a manual status write (PATCH or deactivate, #19):
+    a tool with an in-flight loan and a compartment holding an active
+    placement or a pending-return reservation keep their state until the
+    domain releases them. Mirrors the Rust guards and their messages."""
+    if path == "/tools":
+        active_loan = session.scalar(
+            select(Loan).where(
+                Loan.tool_id == item_id,
+                Loan.status.in_(["CHECKOUT_PENDING", "ACTIVE", "RETURN_PENDING"]),
+            )
+        )
+        if active_loan is not None:
+            raise HTTPException(
+                status_code=409, detail="La herramienta tiene un préstamo activo o pendiente"
+            )
+    elif path == "/compartments":
+        occupied = session.scalar(
+            select(ToolPlacement).where(
+                ToolPlacement.compartment_id == item_id, ToolPlacement.removed_at.is_(None)
+            )
+        )
+        reserved = session.scalar(
+            select(LockerOperation).where(
+                LockerOperation.compartment_id == item_id,
+                LockerOperation.status.in_(RESERVED_RETURN_STATUSES),
+                LockerOperation.command_type == "RETURN",
+            )
+        )
+        if occupied is not None or reserved is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="El compartimiento tiene una ubicación activa o una devolución pendiente",
+            )
+
+
 def add_admin_routes(path: str, model: type[object], action: str) -> None:
     @router.get(path, tags=["administración"])
     def get_all(
@@ -108,6 +175,8 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
 
     @router.post(path, status_code=status.HTTP_201_CREATED, tags=["administración"])
     def create(payload: dict[str, object], session: Session = Depends(get_db)) -> dict[str, object]:
+        if "status" in payload:
+            check_status(path, payload["status"])
         item = model(**payload)
         session.add(item)
         session.flush()
@@ -122,6 +191,9 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
         item = session.get(model, item_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Registro no encontrado")
+        if "status" in payload:
+            check_status(path, payload["status"])
+            guard_status_change(session, path, item_id)
         for key, value in payload.items():
             if key not in {"id", "created_at", "updated_at"} and hasattr(item, key):
                 setattr(item, key, value)
@@ -136,6 +208,7 @@ def add_admin_routes(path: str, model: type[object], action: str) -> None:
             raise HTTPException(status_code=404, detail="Registro no encontrado")
         if not hasattr(item, "status"):
             raise HTTPException(status_code=409, detail="La entidad no admite desactivación")
+        guard_status_change(session, path, item_id)
         item.status = "INACTIVE"
         audit(session, f"{action}_DEACTIVATED", cast(AuditableEntity, item))
         session.commit()

@@ -350,7 +350,10 @@ pub async fn return_loan(
 }
 
 /// Event data that does not match the command fails the operation without
-/// touching the domain (mirror of Python's confirm mismatch branch).
+/// touching the domain (mirror of Python's confirm mismatch branch). The
+/// command may still have been executed by the device, so the loan stays
+/// pending and the operator reconciles through `resolve` (uncertain outcome,
+/// never an automatic rollback).
 pub async fn apply_event_mismatch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     operation: &PgRow,
@@ -367,11 +370,14 @@ pub async fn apply_event_mismatch(
     Ok(())
 }
 
-/// POST /operations/{id}/resolve — administrative reconciliation of an
-/// UNKNOWN operation (corrección C). Requires the lab-admin bearer token, a
-/// verdict, a reason and evidence; every resolution lands in the audit trail.
-/// A late MQTT event after resolution is ignored: the terminal state and the
-/// operator's attestation stand, and the event is logged for follow-up.
+/// POST /operations/{id}/resolve — administrative reconciliation (corrección C).
+/// Accepts an UNKNOWN operation (indeterminable delivery) and a FAILED one that
+/// still holds a pending loan (event-time failure: the compartment may have
+/// opened, so only the operator's attestation releases its resources).
+/// Requires the lab-admin bearer token, a verdict, a reason and evidence;
+/// every resolution lands in the audit trail. A late MQTT event after
+/// resolution is ignored: the terminal state and the operator's attestation
+/// stand, and the event is logged for follow-up.
 pub async fn resolve_operation(
     State(pool): State<PgPool>,
     Path(operation_id): Path<Uuid>,
@@ -409,12 +415,36 @@ pub async fn resolve_operation(
         None => return Err(ApiError::not_found("La operación no existe")),
     };
     let status: String = operation.try_get("status")?;
-    if status != "UNKNOWN" {
+    let command_type: String = operation.try_get("command_type")?;
+    if !matches!(command_type.as_str(), "CHECKOUT" | "RETURN") {
+        return Err(ApiError::conflict("Comando de operación desconocido"));
+    }
+    if status == "FAILED" {
+        // An event-time FAILED (preconditions broke while the compartment
+        // opened, or the event data mismatched) deliberately keeps its loan
+        // blocked: the physical opening may have executed, so resources are
+        // never released automatically. It stays resolvable while the loan is
+        // still pending; the operator's attestation is the only release.
+        let loan_id: Uuid = operation.try_get("loan_id")?;
+        let loan_status: String = query_scalar("SELECT status FROM loans WHERE id = $1")
+            .bind(loan_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !matches!(loan_status.as_str(), "CHECKOUT_PENDING" | "RETURN_PENDING") {
+            return Err(ApiError::conflict(
+                "La operación fallida ya no retiene recursos del dominio",
+            ));
+        }
+        // Both outcomes attest a physical result the domain could not record
+        // (its preconditions already failed), so either way the pending loan
+        // rolls back; the terminal FAILED state itself never changes.
+        revert_pending_loan(&mut tx, &operation).await?;
+    } else if status != "UNKNOWN" {
         return Err(ApiError::conflict(
-            "Solo una operación UNKNOWN puede resolverse",
+            "Solo una operación UNKNOWN o FAILED puede resolverse",
         ));
     }
-    if outcome == "CONFIRMED" {
+    if status == "UNKNOWN" && outcome == "CONFIRMED" {
         // The operator attests the physical execution with evidence; the same
         // precondition checks as an MQTT event apply (audit #17). If they fail,
         // the operation ends FAILED and the pending loan rolls back below so
@@ -427,7 +457,8 @@ pub async fn resolve_operation(
         if applied == "FAILED" {
             revert_pending_loan(&mut tx, &operation).await?;
         }
-    } else {
+    }
+    if status != "FAILED" {
         query("UPDATE locker_operations SET status = 'FAILED', confirmed_at = now(), failure_reason = $2
                WHERE id = $1 AND status = 'UNKNOWN'")
             .bind(operation_id)
@@ -436,7 +467,9 @@ pub async fn resolve_operation(
             .await?;
         // The operator attests the physical action did NOT happen, so the
         // in-flight loan may safely roll back and release its resources.
-        revert_pending_loan(&mut tx, &operation).await?;
+        if outcome == "FAILED" {
+            revert_pending_loan(&mut tx, &operation).await?;
+        }
     }
     let final_status: String = query_scalar("SELECT status FROM locker_operations WHERE id = $1")
         .bind(operation_id)
@@ -467,13 +500,15 @@ pub async fn resolve_operation(
     Ok(Json(dump_row(&row)))
 }
 
-/// Rolls back the in-flight loan of a resolved UNKNOWN operation: CHECKOUT
-/// loans are cancelled (their authorization becomes reusable) and RETURN
-/// loans go back to ACTIVE; conditional updates keep unrelated states intact.
-async fn revert_pending_loan(
+/// Rolls back the in-flight loan of a terminal operation: CHECKOUT loans are
+/// cancelled (their authorization becomes reusable) and RETURN loans go back
+/// to ACTIVE; conditional updates keep unrelated states intact. Callers guard
+/// the command type, so the default branch is unreachable in practice.
+/// Shared by `resolve_operation` and the MQTT publish-time failure path.
+pub async fn revert_pending_loan(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     operation: &PgRow,
-) -> Result<(), ApiError> {
+) -> Result<(), sqlx::Error> {
     let command_type: String = operation.try_get("command_type")?;
     let loan_id: Uuid = operation.try_get("loan_id")?;
     match command_type.as_str() {
@@ -504,7 +539,7 @@ async fn revert_pending_loan(
                 .execute(&mut **tx)
                 .await?;
         }
-        _ => return Err(ApiError::conflict("Comando de operación desconocido")),
+        _ => {}
     }
     Ok(())
 }

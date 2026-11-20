@@ -127,7 +127,11 @@ pub async fn create_placement(
         ));
     }
     let reserved: Option<Uuid> = query_scalar(
-        "SELECT id FROM locker_operations WHERE compartment_id = $1 AND status = 'PENDING' AND command_type = 'RETURN'",
+        // Same reservation rule as `return_loan`: a RETURN keeps the
+        // compartment reserved until it reaches a terminal, reverted state;
+        // UNKNOWN holds it because the physical outcome is indeterminable.
+        "SELECT id FROM locker_operations WHERE compartment_id = $1
+           AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN') AND command_type = 'RETURN'",
     )
     .bind(compartment_id)
     .fetch_optional(&mut *tx)

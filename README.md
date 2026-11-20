@@ -156,6 +156,33 @@ El panel administrativo está disponible en español en `http://127.0.0.1:8083`.
 Incluye inicio, operación simulada, inventario, lockers, administración y
 actividad. El acceso de laboratorio es `admin` / `admin`.
 
+## Contratos de administración (Fase 4.0)
+
+- Los estados administrativos se validan contra una lista explícita por
+  entidad (`ACTIVE/INACTIVE` en sucursales, usuarios, membresías y
+  compartimentos; `ONLINE/INACTIVE` en lockers; `LOCKED/INACTIVE` en
+  cerraduras; `SIMULATED/INACTIVE` en cámaras; `AVAILABLE/INACTIVE` en
+  herramientas). Un estado desconocido responde `422` con el mismo mensaje en
+  ambos backends; el panel ofrece la lista, no texto libre.
+- Los estados de dominio no son editables manualmente: `ON_LOAN` lo fija
+  únicamente la confirmación de retiro, y préstamos, autorizaciones y
+  operaciones no tienen rutas de escritura administrativa.
+- Una herramienta con préstamo activo o pendiente, y un compartimento con
+  ubicación activa o devolución pendiente, rechazan el cambio manual de
+  estado y la desactivación con `409` (con bloqueo transaccional, igual que
+  checkout y devolución).
+- Ninguna respuesta de usuarios o autenticación incluye el atributo
+  `password`, en ninguno de los backends.
+- `POST /api/v1/operations/{id}/resolve` acepta, además de una operación
+  `UNKNOWN`, una operación `FAILED` que aún retiene un préstamo pendiente
+  (fallo de confirmación con apertura físicamente posible). La reversión del
+  préstamo exige la atestación del operador con motivo y evidencia; nunca es
+  automática. Un fallo de publicación sin entrega (p. ej. código de locker
+  ambiguo) revierte préstamo y autorización en la misma transacción.
+- La reserva de un compartimento durante una devolución cubre todos los
+  estados en curso (`PENDING`, `PUBLISHING`, `PUBLISHED`, `UNKNOWN`); una
+  colocación nueva en ese compartimento responde `409`.
+
 ## Desarrollo
 
 Ejecute las validaciones desde cada aplicación:

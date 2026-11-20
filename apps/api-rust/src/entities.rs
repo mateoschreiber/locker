@@ -30,6 +30,11 @@ pub struct Entity {
     pub has_status: bool,
     pub searchable: &'static [&'static str],
     pub fields: &'static [Field],
+    /// Administrative states an admin may write (create/PATCH). Domain-only
+    /// states (e.g. tools `ON_LOAN`) are deliberately absent and rejected
+    /// with 422, so a manual write can never contradict the domain machine.
+    /// Empty for read-only entities without write routes.
+    pub allowed_statuses: &'static [&'static str],
 }
 
 const fn text(name: &'static str, max: usize) -> Field {
@@ -80,6 +85,7 @@ pub const BRANCHES: Entity = Entity {
     has_status: true,
     searchable: &["code", "name"],
     fields: &[text("code", 64), text("name", 160), status("ACTIVE")],
+    allowed_statuses: &["ACTIVE", "INACTIVE"],
 };
 
 pub const ROLES: Entity = Entity {
@@ -90,6 +96,7 @@ pub const ROLES: Entity = Entity {
     has_status: false,
     searchable: &["code", "name"],
     fields: &[text("code", 32), text("name", 100)],
+    allowed_statuses: &[],
 };
 
 pub const USERS: Entity = Entity {
@@ -111,6 +118,7 @@ pub const USERS: Entity = Entity {
         },
         status("ACTIVE"),
     ],
+    allowed_statuses: &["ACTIVE", "INACTIVE"],
 };
 
 pub const MEMBERSHIPS: Entity = Entity {
@@ -126,6 +134,7 @@ pub const MEMBERSHIPS: Entity = Entity {
         uuid_ref("role_id"),
         status("ACTIVE"),
     ],
+    allowed_statuses: &["ACTIVE", "INACTIVE"],
 };
 
 pub const LOCKERS: Entity = Entity {
@@ -141,6 +150,9 @@ pub const LOCKERS: Entity = Entity {
         text("name", 160),
         status("ONLINE"),
     ],
+    // ONLINE is an administrative label here, not an MQTT presence
+    // measurement; real presence arrives with F4.1 heartbeats.
+    allowed_statuses: &["ONLINE", "INACTIVE"],
 };
 
 pub const COMPARTMENTS: Entity = Entity {
@@ -163,6 +175,7 @@ pub const COMPARTMENTS: Entity = Entity {
         },
         status("ACTIVE"),
     ],
+    allowed_statuses: &["ACTIVE", "INACTIVE"],
 };
 
 pub const LOCKS: Entity = Entity {
@@ -177,6 +190,7 @@ pub const LOCKS: Entity = Entity {
         text_opt("hardware_address", 120),
         status("LOCKED"),
     ],
+    allowed_statuses: &["LOCKED", "INACTIVE"],
 };
 
 pub const CAMERAS: Entity = Entity {
@@ -191,6 +205,7 @@ pub const CAMERAS: Entity = Entity {
         text("name", 160),
         status("SIMULATED"),
     ],
+    allowed_statuses: &["SIMULATED", "INACTIVE"],
 };
 
 pub const TOOLS: Entity = Entity {
@@ -207,6 +222,9 @@ pub const TOOLS: Entity = Entity {
         text_opt("rfid_tag", 120),
         status("AVAILABLE"),
     ],
+    // ON_LOAN is set only by the checkout confirmation; it is never
+    // administratively writable.
+    allowed_statuses: &["AVAILABLE", "INACTIVE"],
 };
 
 /// Admin entities with the full generic CRUD.
@@ -231,6 +249,7 @@ pub const AUTHORIZATIONS: Entity = Entity {
     has_status: true,
     searchable: &[],
     fields: &[],
+    allowed_statuses: &[],
 };
 
 pub const LOANS: Entity = Entity {
@@ -241,6 +260,7 @@ pub const LOANS: Entity = Entity {
     has_status: true,
     searchable: &[],
     fields: &[],
+    allowed_statuses: &[],
 };
 
 pub const OPERATIONS: Entity = Entity {
@@ -251,6 +271,7 @@ pub const OPERATIONS: Entity = Entity {
     has_status: true,
     searchable: &[],
     fields: &[],
+    allowed_statuses: &[],
 };
 
 pub const AUDIT: Entity = Entity {
@@ -261,6 +282,7 @@ pub const AUDIT: Entity = Entity {
     has_status: false,
     searchable: &[],
     fields: &[],
+    allowed_statuses: &[],
 };
 
 /// A validated field value ready to bind.

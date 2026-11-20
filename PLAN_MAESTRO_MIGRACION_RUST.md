@@ -285,7 +285,89 @@ sigue siendo el backend activo del laboratorio y no se ha conectado hardware
 real.
 
 
+## Avance de Fase 4.0 — contratos e integridad previos al cutover
+
+F4.0 corrige los defectos contractuales y de integridad pendientes antes del
+cutover. Python sigue atendiendo el laboratorio; nada de este bloque cambia
+qué backend está conectado ni inicia F4.1/F4.2.
+
+- **#19 cerrado:** matriz explícita de estados administrativos por entidad
+  (`ACTIVE/INACTIVE`, `ONLINE`, `LOCKED`, `SIMULATED`, `AVAILABLE/INACTIVE`;
+  `ONLINE` es etiqueta administrativa, no presencia MQTT — eso llega en F4.1),
+  validada en Python y Rust con `422` idéntico y paridad verificada. Los
+  estados de dominio (`ON_LOAN` de herramientas; préstamos, autorizaciones y
+  operaciones no tienen rutas de escritura) no son editables. Guardias `409`
+  con bloqueo transaccional (`FOR UPDATE`, el mismo que checkout/devolución)
+  para herramientas con préstamo activo o pendiente y compartimentos con
+  ubicación activa o devolución pendiente; `deactivate` ya no permite eludir
+  las guardias de PATCH. El panel sustituyó el `prompt()` por una lista por
+  entidad y no ofrece controles sobre estados de dominio.
+- **#2 (dump) cerrado:** `dump()` de Python ya no expone `password` en ninguna
+  respuesta (login, `/auth/me`, listados, detalle, CRUD), con prueba en la
+  suite aislada. El almacenamiento en claro y HTTPS siguen siendo Fase 5.
+- **#14 cerrado:** el historial de inventario consulta
+  `GET /tools/{id}/history` por selección con `AbortController`; una respuesta
+  tardía de otra herramienta no puede sobrescribir la visible (prueba con el
+  orden de respuestas invertido), muestra la ubicación activa y estados
+  vacíos explícitos.
+- **Integridad MQTT (hallazgos #22/#23 de la revisión de F4.0):** los fallos
+  con resultado físico **conocido como no ejecutado** (publicación que nunca
+  salió, p. ej. código de locker ambiguo) revierten préstamo y autorización en
+  la misma transacción con el helper compartido `revert_pending_loan`. Los
+  fallos **inciertos** en confirmación por evento (compartimento ocupado,
+  ubicación desaparecida, datos que no coinciden) nunca liberan recursos
+  automáticamente: la operación queda `FAILED` reteniendo el préstamo y
+  `resolve` la acepta mientras dure esa retención, con atestación auditable y
+  transición terminal idempotente (un evento tardío o una segunda resolución
+  no cambian nada). La reserva de compartimentos de `create_placement` cubre
+  `PENDING/PUBLISHING/PUBLISHED/UNKNOWN` (antes solo `PENDING`, la ventana que
+  el puente abre en ~250 ms), y la confirmación MQTT bloquea la fila del
+  compartimento como los escritores REST.
+- **Pruebas frontend reales** (Vitest + Testing Library, dos dependencias de
+  desarrollo): historial aislado e invertido, edición de estado con PATCH,
+  mensajes de error del backend y estados vacíos.
+- **Línea base de rendimiento** registrada en
+  [`docs/PERFORMANCE_BASELINE.md`](docs/PERFORMANCE_BASELINE.md) para comparar
+  F4.2 (cálculo del ciclo, latencias, tamaños, CPU/RAM observados).
+
+Validación local ejecutada (20-11-2026): `cargo fmt --check`,
+`cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`
+(6 unitarias) y `cargo test --locked -- --ignored --test-threads=1` con
+PostgreSQL y Mosquitto aislados: **26/26** (7 nuevas: contrato de estados y
+guardias, fallo de publicación con reversión y reintento exitoso, devolución
+con compartimento ocupado conciliable y evento tardío ignorado, checkout sin
+ubicación conciliable, evento con datos incorrectos, reserva por cada estado
+de devolución y concurrencia colocación/devolución al mismo compartimento);
+build release equivalente al construir la imagen Docker;
+`scripts/test_rust_docker.py` (bind loopback, gate MQTT, 503 sin PostgreSQL)
+y `scripts/test_rust_mqtt.py` completos (flujo, duplicado, caída, reinicio,
+coexistencia). Suite Python aislada **10/10** (nueva de contratos de estado,
+exclusión de `password` y guardias) y `scripts/test_docker_restart.py`;
+Ruff y mypy de la API. Paridad Python/Rust completa (puente Rust apagado),
+incluyendo los **seis contratos nuevos** con `detail` idéntico (422 estado
+desconocido, 422 estados administrativos de locker, 422 estado de dominio en
+creación, 409 herramienta con préstamo, 409 desactivación de esa herramienta,
+409 compartimento con ubicación). Lint, build y pruebas web (4 pruebas de
+componentes) en Node 24 local; `docker compose config` y `git diff --check`
+sin problemas.
+
+Cambios de contrato deliberados de este bloque: PATCH/create con estado fuera
+de la lista responden `422` (antes `200` en ambos backends: la prueba de CRUD
+que fijaba el comportamiento antiguo se actualizó al contrato nuevo);
+desactivar herramienta con préstamo o compartimento ocupado/reservado responde
+`409` (antes `200`); `resolve` acepta `FAILED` con préstamo pendiente (antes
+solo `UNKNOWN`); ninguna respuesta incluye `password` (Rust ya lo cumplía;
+la paridad ahora compara el contrato limpio en ambos).
+
+Riesgos pendientes conocidos (sin cambios): autenticación/token fijo y MQTT
+anónimo sin TLS (#1/#3, Fase 5); almacenamiento de contraseñas en claro (#2
+resto, Fase 5); latidos #15, panel de conciliación/estados de operación y
+paginación #13 (F4.1/F4.2); esquemas sin uso #18 (se retiran con Python).
+No se realizó el cutover: Python sigue conectado al laboratorio y Rust
+permanece aislado.
+
 ## Cierre de los tres hallazgos de Fase 0
+
 
 1. **Exposición del panel:** Compose publica `127.0.0.1:8083` por defecto. `LOCKER_BIND_ADDRESS` permite seleccionar explícitamente una dirección privada; la configuración efectiva se comprobó tanto con el valor predeterminado como con una dirección LAN de ejemplo. El acceso LAN requiere restringir la red y no convierte las credenciales de laboratorio en seguras.
 2. **Sincronización MQTT:** la API marca la suscripción activa al recibir SUBACK y `/health/ready` responde 503 hasta entonces. El simulador anuncia disponibilidad después del SUBACK y usa aviso retenido de desconexión; las pruebas esperan una señal reciente con timeout y diagnóstico. Se probaron aceptación, rechazo y desconexión de suscripciones.

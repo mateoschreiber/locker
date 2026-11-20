@@ -208,12 +208,7 @@ async fn publish_claimed(
         .fetch_one(pool)
         .await?;
     if duplicates > 1 {
-        fail_operation(
-            pool,
-            operation_id,
-            "Código de locker ambiguo entre sucursales",
-        )
-        .await?;
+        fail_operation(pool, &operation).await?;
         return Ok(());
     }
     let _ = &command_type; // OPEN_COMPARTMENT is the only command in protocol v1.
@@ -278,20 +273,23 @@ async fn mark_unknown(pool: &PgPool, operation_id: Uuid, reason: &str) -> Result
     Ok(())
 }
 
-async fn fail_operation(
-    pool: &PgPool,
-    operation_id: Uuid,
-    reason: &str,
-) -> Result<(), sqlx::Error> {
+async fn fail_operation(pool: &PgPool, operation: &PgRow) -> Result<(), sqlx::Error> {
+    // The command never reached the broker: the physical outcome is KNOWN
+    // (not executed), so the pending loan and its reservation roll back in
+    // the same transaction that marks the operation FAILED. Event-time
+    // failures are different: the compartment may have opened, so those
+    // keep their resources and go through `resolve` instead.
+    let operation_id: Uuid = operation.try_get("id")?;
     let mut tx = pool.begin().await?;
     query(
         "UPDATE locker_operations SET status = 'FAILED', failure_reason = $2
            WHERE id = $1 AND status = 'PUBLISHING'",
     )
     .bind(operation_id)
-    .bind(reason)
+    .bind("Código de locker ambiguo entre sucursales")
     .execute(&mut *tx)
     .await?;
+    crate::operations::revert_pending_loan(&mut tx, operation).await?;
     let actor = admin_actor(&mut tx).await;
     audit(
         &mut tx,
@@ -413,7 +411,11 @@ pub async fn confirm_event(
 /// Applies the domain effects of a confirmed physical execution (mirror of
 /// Python's `confirm`): CHECKOUT removes the placement and activates the
 /// loan; RETURN places the tool back and closes the loan. Precondition
-/// violations fail the operation instead of forcing state (audit #17).
+/// violations fail the operation WITHOUT rolling the loan back: the event
+/// proves the compartment opened, so the physical outcome is uncertain and
+/// resources are never released automatically — the operator releases them
+/// through `POST /operations/{id}/resolve`, which accepts such a FAILED
+/// operation while its loan is still pending (audit #17).
 pub async fn apply_confirmation(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     operation: &PgRow,
@@ -475,6 +477,12 @@ pub async fn apply_confirmation(
         }
         ("RETURN", "RETURN_PENDING") => {
             let compartment_id: Uuid = operation.try_get("compartment_id")?;
+            // Serialize against `return_loan` and `create_placement`, which
+            // take the same row lock before their occupancy checks.
+            query("SELECT id FROM compartments WHERE id = $1 FOR UPDATE")
+                .bind(compartment_id)
+                .fetch_optional(&mut **tx)
+                .await?;
             let occupied: Option<Uuid> = query_scalar(
                 "SELECT id FROM tool_placements WHERE compartment_id = $1 AND removed_at IS NULL",
             )

@@ -307,6 +307,8 @@ async fn admin_crud_validates_contracts() {
     let (status, _) = get(&app, &format!("/api/v1/branches/{missing}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // #19: unknown states are rejected with 422 and the row stays untouched;
+    // a valid administrative state (INACTIVE) is the accepted transition.
     let (status, value) = request(
         app.clone(),
         "PATCH",
@@ -314,8 +316,20 @@ async fn admin_crud_validates_contracts() {
         Some(json!({ "status": "MAINTENANCE" })),
     )
     .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(
+        value["detail"],
+        "Campo 'status': debe ser uno de ACTIVE, INACTIVE"
+    );
+    let (status, value) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/branches/{branch_id}"),
+        Some(json!({ "status": "INACTIVE" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    assert_eq!(value["status"], "MAINTENANCE");
+    assert_eq!(value["status"], "INACTIVE");
     let (status, value) = request(
         app.clone(),
         "PATCH",
@@ -326,7 +340,7 @@ async fn admin_crud_validates_contracts() {
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(value["code"], "B1");
 
-    let (status, value) = get(&app, "/api/v1/branches?q=B1&status=MAINTENANCE").await;
+    let (status, value) = get(&app, "/api/v1/branches?q=B1&status=INACTIVE").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         value.as_array().unwrap().len(),
@@ -1766,4 +1780,803 @@ async fn readiness_gates_on_mqtt_subscription_flag() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// F4.0: manual status contract (#19), domain guards, MQTT failure semantics
+// (F1) and compartment reservation (F2).
+// ---------------------------------------------------------------------------
+
+/// POST /operations/{id}/resolve with the lab token, mirroring the panel.
+async fn resolve(
+    app: &Router,
+    operation_id: &str,
+    outcome: &str,
+    reason: &str,
+    evidence: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/operations/{operation_id}/resolve"))
+        .header("authorization", "Bearer lab-admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "outcome": outcome, "reason": reason, "evidence": evidence }).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("valid JSON response"),
+    )
+}
+
+async fn status_of(pool: &PgPool, sql: &str, id: Uuid) -> String {
+    let value: String = query_scalar(sql).bind(id).fetch_one(pool).await.unwrap();
+    value
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn manual_status_contract_and_domain_guards() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
+
+    // Unknown state: 422 with the allowed list, and nothing changes.
+    let (status, value) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/branches/{}", lab.branch),
+        Some(json!({ "status": "BANANA" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(
+        value["detail"],
+        "Campo 'status': debe ser uno de ACTIVE, INACTIVE"
+    );
+    assert_eq!(
+        status_of(
+            &pool,
+            "SELECT status FROM branches WHERE id = $1",
+            lab.branch
+        )
+        .await,
+        "ACTIVE",
+        "rejected write must not change the row"
+    );
+
+    // The list is per entity: lockers speak ONLINE, not ACTIVE.
+    let (status, value) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/lockers/{}", lab.locker),
+        Some(json!({ "status": "ACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(
+        value["detail"],
+        "Campo 'status': debe ser uno de ONLINE, INACTIVE"
+    );
+
+    // A valid administrative transition is accepted both ways.
+    let (status, _) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/branches/{}", lab.branch),
+        Some(json!({ "status": "INACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/branches/{}", lab.branch),
+        Some(json!({ "status": "ACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // ON_LOAN is domain-only: not creatable, not writable.
+    let (status, value) = post(
+        &app,
+        "/api/v1/tools",
+        json!({ "asset_code": "TOOL-NEW", "name": "Nueva", "status": "ON_LOAN" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    let (status, value) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/tools/{}", lab.tool),
+        Some(json!({ "status": "ON_LOAN" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+
+    // A tool with an in-flight loan keeps its state: PATCH and deactivate
+    // both refuse while the domain machine owns the tool.
+    let loan = Uuid::new_v4();
+    query(
+        "INSERT INTO loans (id, tool_id, user_id, status) VALUES ($1, $2, $3, 'CHECKOUT_PENDING')",
+    )
+    .bind(loan)
+    .bind(lab.tool)
+    .bind(lab.admin)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, value) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/tools/{}", lab.tool),
+        Some(json!({ "status": "INACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        value["detail"],
+        "La herramienta tiene un préstamo activo o pendiente"
+    );
+    let (status, value) = action(&app, &format!("/api/v1/tools/{}/deactivate", lab.tool)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM tools WHERE id = $1", lab.tool).await,
+        "AVAILABLE",
+        "guard must leave the tool untouched"
+    );
+    // Non-protected fields of the same tool stay editable (only status is guarded).
+    let (status, _) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/tools/{}", lab.tool),
+        Some(json!({ "name": "Otro nombre" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    query("DELETE FROM loans WHERE id = $1")
+        .bind(loan)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Without the loan the same transition is allowed again.
+    let (status, _) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/tools/{}", lab.tool),
+        Some(json!({ "status": "INACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/tools/{}", lab.tool),
+        Some(json!({ "status": "AVAILABLE" })),
+    )
+    .await;
+
+    // A compartment holding a placement (or reserved by a pending return)
+    // cannot be deactivated or have its status changed by hand.
+    let (status, value) = action(
+        &app,
+        &format!("/api/v1/compartments/{}/deactivate", lab.compartment2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        value["detail"],
+        "El compartimiento tiene una ubicación activa o una devolución pendiente"
+    );
+    let (status, _) = request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/compartments/{}", lab.compartment3),
+        Some(json!({ "status": "INACTIVE" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "free compartment is editable");
+    request(
+        app.clone(),
+        "PATCH",
+        &format!("/api/v1/compartments/{}", lab.compartment3),
+        Some(json!({ "status": "ACTIVE" })),
+    )
+    .await;
+    query("UPDATE tool_placements SET removed_at = now() WHERE compartment_id = $1")
+        .bind(lab.compartment2)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = action(
+        &app,
+        &format!("/api/v1/compartments/{}/deactivate", lab.compartment2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "empty compartment deactivates");
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
+async fn publish_failure_reverts_loan_and_authorization() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    // locker "L1" exists in two branches: the #9 publish-time check refuses
+    // it. The command never reaches the broker, so the failure is known NOT
+    // executed and the loan must roll back in the same transaction.
+    place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
+
+    let settings = mqtt_settings();
+    let (simulator, mut commands) = start_simulator(&settings).await;
+    let flag = Arc::new(AtomicBool::new(false));
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    let (status, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let correlation = operation["correlation_id"].as_str().unwrap().to_owned();
+    wait_for_status(&pool, &correlation, "FAILED").await;
+    let failure: String =
+        query_scalar("SELECT failure_reason FROM locker_operations WHERE correlation_id = $1")
+            .bind(&correlation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failure, "Código de locker ambiguo entre sucursales");
+
+    // Transactional rollback: no pending loan, reusable authorization,
+    // placement intact — nothing stays blocked by the dead operation.
+    assert_eq!(
+        status_of(
+            &pool,
+            "SELECT status FROM authorizations WHERE id = $1",
+            authorization
+        )
+        .await,
+        "APPROVED"
+    );
+    let loan: Option<String> = query_scalar("SELECT status FROM loans WHERE tool_id = $1")
+        .bind(lab.tool)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert_eq!(loan.as_deref(), Some("CANCELLED"));
+    let placements: i64 = query_scalar(
+        "SELECT COUNT(*) FROM tool_placements WHERE tool_id = $1 AND removed_at IS NULL",
+    )
+    .bind(lab.tool)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(placements, 1, "origin placement must survive");
+
+    // The reverted FAILED operation holds no resources: resolve refuses it.
+    let operation_id = operation["id"].as_str().unwrap().to_owned();
+    let (status, value) = resolve(&app, &operation_id, "FAILED", "sin efecto", "n/a").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        value["detail"],
+        "La operación fallida ya no retiene recursos del dominio"
+    );
+
+    // The authorization is reusable: move the tool somewhere unambiguous and
+    // complete a real checkout over the broker.
+    query("UPDATE tool_placements SET removed_at = now() WHERE tool_id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
+    let (status, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let command = next_command(&mut commands).await;
+    assert_eq!(command.raw["locker_id"], "L2");
+    respond_opened(&simulator, &command).await;
+    wait_for_status(&pool, command.correlation_id.as_str(), "CONFIRMED").await;
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM tools WHERE id = $1", lab.tool).await,
+        "ON_LOAN"
+    );
+    bridge.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
+async fn return_event_with_occupied_compartment_keeps_loan_and_resolves() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
+
+    let settings = mqtt_settings();
+    let (simulator, mut commands) = start_simulator(&settings).await;
+    let flag = Arc::new(AtomicBool::new(false));
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+
+    // Complete checkout over the broker so the tool is on the person.
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    let checkout_command = next_command(&mut commands).await;
+    respond_opened(&simulator, &checkout_command).await;
+    wait_for_status(&pool, checkout_command.correlation_id.as_str(), "CONFIRMED").await;
+
+    // Order the return but let another tool land in the destination before
+    // the event arrives (a change the reservation checks could not see).
+    let loan: (Uuid, String) = sqlx::query_as(
+        "SELECT id, status FROM loans WHERE tool_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(lab.tool)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(loan.1, "ACTIVE");
+    let (status, operation) = action(&app, &format!("/api/v1/loans/{}/return", loan.0)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let return_command = next_command(&mut commands).await;
+    place(&pool, lab.tool2, lab.branch, lab.locker2, lab.compartment2).await;
+
+    // The compartment DID open: the physical outcome is uncertain, so the
+    // loan is never released automatically — the operation is FAILED and the
+    // operator reconciles.
+    respond_opened(&simulator, &return_command).await;
+    wait_for_status(&pool, return_command.correlation_id.as_str(), "FAILED").await;
+    let failure: String =
+        query_scalar("SELECT failure_reason FROM locker_operations WHERE correlation_id = $1")
+            .bind(return_command.correlation_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failure, "Compartment is occupied");
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan.0).await,
+        "RETURN_PENDING",
+        "uncertain outcome must keep the loan blocked"
+    );
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM tools WHERE id = $1", lab.tool).await,
+        "ON_LOAN"
+    );
+
+    // Duplicate/late events cannot re-apply or re-fail the terminal state.
+    respond_opened(&simulator, &return_command).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan.0).await,
+        "RETURN_PENDING"
+    );
+    let operation_id = operation["id"].as_str().unwrap().to_owned();
+    let audits: i64 = count(
+        &pool,
+        &format!("SELECT COUNT(*) FROM audit_events WHERE action = 'MQTT_FAILED' AND entity_id = '{operation_id}'"),
+    )
+    .await;
+    assert_eq!(audits, 1, "late duplicate event re-processed the operation");
+
+    // The operator attests the tool did not end up inside: the pending loan
+    // rolls back, the FAILED state itself stays untouched.
+    let (status, value) = resolve(
+        &app,
+        &operation_id,
+        "FAILED",
+        "verificado en sitio",
+        "compartimento ocupado por otro activo",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "FAILED", "{value}");
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan.0).await,
+        "ACTIVE"
+    );
+    let resolved: String = query_scalar(
+        "SELECT metadata_json->>'status' FROM audit_events WHERE action = 'OPERATION_RESOLVED_FAILED' AND entity_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(resolved, "FAILED");
+
+    // A resolved FAILED is terminal: a second resolution refuses.
+    let (status, value) = resolve(&app, &operation_id, "FAILED", "repetido", "n/a").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+
+    // The loan is ACTIVE again, so a fresh return can be ordered.
+    query("UPDATE tool_placements SET removed_at = now() WHERE tool_id = $1")
+        .bind(lab.tool2)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, operation) = action(&app, &format!("/api/v1/loans/{}/return", loan.0)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let command = next_command(&mut commands).await;
+    respond_opened(&simulator, &command).await;
+    wait_for_status(&pool, command.correlation_id.as_str(), "CONFIRMED").await;
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan.0).await,
+        "RETURNED"
+    );
+    bridge.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL/MQTT"]
+async fn checkout_event_without_placement_fails_and_releases_via_resolve() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
+
+    let settings = mqtt_settings();
+    let (simulator, mut commands) = start_simulator(&settings).await;
+    let flag = Arc::new(AtomicBool::new(false));
+    let bridge = mqtt::start(pool.clone(), settings.clone(), flag);
+
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    let (status, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let command = next_command(&mut commands).await;
+    // The origin placement disappears while the command is in flight.
+    query("UPDATE tool_placements SET removed_at = now() WHERE tool_id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    respond_opened(&simulator, &command).await;
+    wait_for_status(&pool, command.correlation_id.as_str(), "FAILED").await;
+    let failure: String =
+        query_scalar("SELECT failure_reason FROM locker_operations WHERE correlation_id = $1")
+            .bind(command.correlation_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failure, "Active placement not found");
+    let loan_id: Uuid = query_scalar("SELECT id FROM loans WHERE tool_id = $1")
+        .bind(lab.tool)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan_id).await,
+        "CHECKOUT_PENDING",
+        "uncertain outcome keeps the checkout blocked until reconciliation"
+    );
+
+    // Reconciliation with outcome CONFIRMED still cannot apply (the
+    // precondition is gone), so it ends FAILED with the loan released.
+    let operation_id = operation["id"].as_str().unwrap().to_owned();
+    let (status, value) = resolve(
+        &app,
+        &operation_id,
+        "CONFIRMED",
+        "verificado en sitio",
+        "el activo fue retirado manualmente",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "FAILED", "{value}");
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan_id).await,
+        "CANCELLED"
+    );
+    assert_eq!(
+        status_of(
+            &pool,
+            "SELECT status FROM authorizations WHERE id = $1",
+            authorization
+        )
+        .await,
+        "APPROVED",
+        "the authorization becomes reusable again"
+    );
+    bridge.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn mismatched_event_fails_without_touching_the_domain() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker2, lab.compartment2).await;
+
+    // No bridge: the operation stays PENDING; force the claimed state the
+    // bridge would own and feed a mismatched event directly.
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    let (status, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let correlation = operation["correlation_id"].as_str().unwrap().to_owned();
+    force_status(&pool, &correlation, "PUBLISHING").await;
+    let wrong_compartment = Uuid::new_v4();
+    mqtt::confirm_event(&pool, &correlation, "L2", wrong_compartment)
+        .await
+        .unwrap();
+    let failure: String =
+        query_scalar("SELECT failure_reason FROM locker_operations WHERE correlation_id = $1")
+            .bind(&correlation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failure, "Command data does not match event");
+    let loan_id: Uuid = query_scalar("SELECT id FROM loans WHERE tool_id = $1")
+        .bind(lab.tool)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan_id).await,
+        "CHECKOUT_PENDING",
+        "a mismatched event never rolls the domain back automatically"
+    );
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM tools WHERE id = $1", lab.tool).await,
+        "AVAILABLE"
+    );
+
+    // The operator reconciles and the loan is released.
+    let operation_id = operation["id"].as_str().unwrap().to_owned();
+    let (status, value) = resolve(&app, &operation_id, "FAILED", "evento ajeno", "n/a").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan_id).await,
+        "CANCELLED"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn placement_reservation_covers_every_pending_return_state() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+
+    let placement_json = json!({
+        "tool_id": lab.tool.to_string(),
+        "branch_id": lab.branch2.to_string(),
+        "locker_id": lab.locker3.to_string(),
+        "compartment_id": lab.compartment3.to_string(),
+    });
+
+    let insert_return_operation = |status: &'static str| {
+        let pool = pool.clone();
+        let compartment = lab.compartment3;
+        async move {
+            let correlation = Uuid::new_v4().to_string();
+            let loan = Uuid::new_v4();
+            query("INSERT INTO loans (id, tool_id, user_id, status) VALUES ($1, $2, $3, 'ACTIVE')")
+                .bind(loan)
+                .bind(lab.tool)
+                .bind(lab.admin)
+                .execute(&pool)
+                .await
+                .unwrap();
+            query(
+                "INSERT INTO locker_operations
+                     (id, correlation_id, command_type, status, tool_id, loan_id, branch_id,
+                      locker_id, compartment_id, origin)
+                 VALUES ($1, $2, 'RETURN', $3, $4, $5, $6, $7, $8, 'rust')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(&correlation)
+            .bind(status)
+            .bind(lab.tool)
+            .bind(loan)
+            .bind(lab.branch)
+            .bind(lab.locker3)
+            .bind(compartment)
+            .execute(&pool)
+            .await
+            .unwrap();
+            correlation
+        }
+    };
+
+    // Every in-flight RETURN state keeps the reservation (F2): PENDING is
+    // only the first of them.
+    for state in ["PENDING", "PUBLISHING", "PUBLISHED", "UNKNOWN"] {
+        let correlation = insert_return_operation(state).await;
+        let (status, value) = post(&app, "/api/v1/placements", placement_json.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{state}: {value}");
+        assert_eq!(
+            value["detail"], "El compartimiento está reservado por una devolución pendiente",
+            "{state}"
+        );
+        // Terminal states release it.
+        force_status(&pool, &correlation, "CONFIRMED").await;
+        let (status, _) = post(&app, "/api/v1/placements", placement_json.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{state}: CONFIRMED must release"
+        );
+        query("UPDATE tool_placements SET removed_at = now() WHERE compartment_id = $1")
+            .bind(lab.compartment3)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let loan: Uuid = query_scalar(
+            "SELECT id FROM loans WHERE tool_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(lab.tool)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        query("DELETE FROM locker_operations WHERE correlation_id = $1")
+            .bind(&correlation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        query("DELETE FROM loans WHERE id = $1")
+            .bind(loan)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // A FAILED operation no longer reserves: it is terminal.
+    let correlation = insert_return_operation("FAILED").await;
+    let (status, _) = post(&app, "/api/v1/placements", placement_json.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "FAILED must not reserve");
+    query("UPDATE tool_placements SET removed_at = now() WHERE compartment_id = $1")
+        .bind(lab.compartment3)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Concurrent placements into the same compartment: exactly one wins,
+    // the other gets the occupied conflict, and no duplicate active
+    // placement survives (guard first, unique index as backstop).
+    let app2 = app.clone();
+    let first =
+        tokio::spawn(
+            async move { post(&app2, "/api/v1/placements", placement_json.clone()).await },
+        );
+    let second_payload = json!({
+        "tool_id": lab.tool2.to_string(),
+        "branch_id": lab.branch2.to_string(),
+        "locker_id": lab.locker3.to_string(),
+        "compartment_id": lab.compartment3.to_string(),
+    });
+    let second =
+        tokio::spawn(async move { post(&app, "/api/v1/placements", second_payload).await });
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+    let winners = [first.0, second.0]
+        .iter()
+        .filter(|status| **status == StatusCode::CREATED)
+        .count();
+    assert_eq!(
+        winners, 1,
+        "both concurrent placements won: {first:?} {second:?}"
+    );
+    let active: i64 = query_scalar(
+        "SELECT COUNT(*) FROM tool_placements WHERE compartment_id = $1 AND removed_at IS NULL",
+    )
+    .bind(lab.compartment3)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, 1);
+    query("DELETE FROM locker_operations WHERE correlation_id = $1")
+        .bind(&correlation)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn concurrent_placement_and_return_into_the_same_compartment_serialize() {
+    let (pool, app, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    // tool is OUT (loan ACTIVE) and compartment3 is free: a placement and a
+    // return race for it. One must win; the loser gets a 409 explaining why.
+    let loan = Uuid::new_v4();
+    query("INSERT INTO loans (id, tool_id, user_id, status) VALUES ($1, $2, $3, 'ACTIVE')")
+        .bind(loan)
+        .bind(lab.tool)
+        .bind(lab.admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+    query("UPDATE tools SET status = 'ON_LOAN' WHERE id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The tool's latest (already removed) placement decides the return
+    // destination: both the return and the new placement race for it.
+    place(&pool, lab.tool, lab.branch2, lab.locker3, lab.compartment3).await;
+    query("UPDATE tool_placements SET removed_at = now() WHERE tool_id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let placement_json = json!({
+        "tool_id": lab.tool2.to_string(),
+        "branch_id": lab.branch2.to_string(),
+        "locker_id": lab.locker3.to_string(),
+        "compartment_id": lab.compartment3.to_string(),
+    });
+    let app2 = app.clone();
+    let placement =
+        tokio::spawn(async move { post(&app2, "/api/v1/placements", placement_json).await });
+    let return_uri = format!("/api/v1/loans/{loan}/return");
+    let return_op = tokio::spawn(async move { action(&app, &return_uri).await });
+    let (placement, return_op) = (placement.await.unwrap(), return_op.await.unwrap());
+
+    let won_placement = placement.0 == StatusCode::CREATED;
+    let won_return = return_op.0 == StatusCode::ACCEPTED;
+    assert!(
+        won_placement ^ won_return,
+        "both won the same compartment: {placement:?} {return_op:?}"
+    );
+    if won_placement {
+        // The return lost to the occupied compartment.
+        assert_eq!(return_op.0, StatusCode::CONFLICT, "{return_op:?}");
+        let active: i64 = query_scalar(
+            "SELECT COUNT(*) FROM tool_placements WHERE compartment_id = $1 AND removed_at IS NULL",
+        )
+        .bind(lab.compartment3)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 1);
+        assert_eq!(
+            status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan).await,
+            "ACTIVE",
+            "the losing return must not leave the loan pending"
+        );
+    } else {
+        // The placement lost to the reservation.
+        assert_eq!(placement.0, StatusCode::CONFLICT, "{placement:?}");
+        let reserved: i64 = query_scalar(
+            "SELECT COUNT(*) FROM locker_operations WHERE compartment_id = $1
+               AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN') AND command_type = 'RETURN'",
+        )
+        .bind(lab.compartment3)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reserved, 1);
+    }
 }
