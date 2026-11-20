@@ -58,3 +58,15 @@ Mismo procedimiento, mismo seed: (1) solicitudes/min con carga por vista,
 (2) pares latencia/tamaño de los endpoints que sobrevivan a la paginación,
 (3) CPU/RAM de API y PostgreSQL en la misma ventana. Un éxito de F4.2 es
  reducir los 15×ciclo a ≤3 por vista activa y el ~52 KB/ciclo proporcionalmente.
+
+## Delta F4.1 (medido sobre el preview aislado Rust)
+
+- El ciclo del panel contra **Python** queda en 15 solicitudes (sin
+  presencia ni conciliación: `GET /capabilities` responde 404 y el panel no
+  vuelve a pedirlas en el ciclo).
+- Contra **Rust** el ciclo pasa a 16: `GET /api/v1/lockers/presence`
+  añade **6,4 ms promedio / 23,3 ms p95 / 336 B** (estado calculado en
+  memoria, sin consultas por locker). `GET /capabilities` (~3 ms / 32 B) se
+  pide una única vez tras el login, no por ciclo.
+- La vista de Operaciones no añade solicitudes: enriquece filas con las
+  entidades ya sondeadas.

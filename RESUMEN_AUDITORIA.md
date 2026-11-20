@@ -6,6 +6,9 @@ la auditoría original (commit `cb558b3`) conservando la numeración de
 hallazgos, que el Plan Maestro y la documentación referencian.
 Actualización F4.0 (20-11-2026): #2-dump, #14, #19, #22
 y #23 cerrados; ver "Avance de Fase 4.0" en el Plan Maestro.
+Actualización F4.1 (20-11-2026): #15 cerrado (presencia observada y
+conciliación visible en el panel, con entorno aislado de prueba); ver
+"Avance de Fase 4.1" en el Plan Maestro.
 
 ## Diagnóstico
 
@@ -60,7 +63,7 @@ Navegador → Nginx y React → FastAPI (activo) → PostgreSQL (lab)
 | 12 | P1 | Identidad MQTT compartida y consumidor duplicado. | **Resuelto en Rust (F3).** `client_id` propio + partición por `origin` y estados, probado en coexistencia sobre una base compartida. Python mantiene el `client_id` fijo (réplicas Python seguirían expulsándose). | [coexistencia](scripts/test_rust_mqtt.py), [puente](apps/api-rust/src/mqtt.rs#L40) |
 | 13 | P2 | 14 colecciones por ciclo, dashboard cada 4 s, sin paginación. | **Pendiente (F4).** | [panel](apps/web/src/App.tsx#L43) |
 | 14 | P2 | Historial puede incluir ubicaciones de otros activos. | **Resuelto (F4.0).** El panel consulta `GET /tools/{id}/history` por selección con `AbortController`; una respuesta tardía de otra herramienta no sobrescribe la visible (prueba con orden de respuestas invertido). | [filtro](apps/web/src/App.tsx#L81), [prueba](apps/web/src/App.test.tsx) |
-| 15 | P2 | Presencia mostrada sin consumir latidos. | **Pendiente (F4).** El simulador publica `LOCKER_HEARTBEAT`; nadie lo consume. | [simulador](apps/locker-simulator/locker_simulator/__main__.py#L24) |
+| 15 | P2 | Presencia mostrada sin consumir latidos. | **Resuelto (F4.1).** El puente Rust consume `locker/+/status` (tras el SUBACK de events, readiness intacto), expone `GET /lockers/presence` con ONLINE/STALE/OFFLINE/UNKNOWN y retained antiguo validado por timestamp; el panel la muestra y el dashboard deja de afirmar "todo listo" con incidencias. | [presencia](apps/api-rust/src/presence.rs#L1), [panel](apps/web/src/App.tsx#L100) |
 | 16 | P2 | Falta de pruebas de flujos críticos. | **Muy avanzado.** Suites aisladas PostgreSQL/Mosquitto (Rust 19/19, Python 9/9, simulador 7/7), migraciones, paridad de contratos, escenarios Docker de reinicio y caída, CI con 8 jobs. Faltan pruebas de permisos (F5) y de interfaz profunda. | [ci.yml](.github/workflows/ci.yml) |
 | 17 | P2 | Fallos sin vía de recuperación del préstamo. | **Resuelto en Rust (F3/3.6 + F4.0).** `UNKNOWN` conciliable; un `FAILED` que aún retiene un préstamo pendiente también (`resolve` exige atestación; la reversión nunca es automática cuando la apertura pudo ejecutarse). Fallo de publicación sin entrega (p. ej. código ambiguo) revierte en la misma transacción. Python sin conciliación hasta F4. | [resolve](apps/api-rust/src/operations.rs#L375), [puente](apps/api-rust/src/mqtt.rs#L281) |
 | 18 | P3 | Esquemas sin uso (12 clases). | **Pendiente (F4).** Se retiran junto con Python. | [schemas](apps/api/app/modules/schemas.py) |
@@ -84,7 +87,8 @@ evidencia del movimiento y deduplicación persistente (la del simulador es una
 ventana acotada de 10 000 correlaciones, perdida al reiniciar, documentada
 como caché y no como garantía). El ciclo Rust distingue orden solicitada,
 publicación aceptada por el broker, apertura confirmada e incierto conciliable;
-el panel debe reflejar esa distinción (F4).
+el panel refleja esa distinción y ofrece la conciliación con atestación desde
+F4.1 (vista Operaciones, gated por `GET /api/v1/capabilities`).
 
 ## Rendimiento y frontend
 

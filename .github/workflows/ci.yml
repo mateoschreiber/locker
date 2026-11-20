@@ -116,6 +116,8 @@ jobs:
       - run: docker compose build
       - run: docker compose -p locker-rust-ci --profile rust build api-rust
       - run: python scripts/test_rust_docker.py locker-rust-ci-api-rust
+      - run: docker compose -f compose.rust-preview.yaml config --quiet
+      - run: python scripts/test_rust_preview.py
 
   integration:
     runs-on: ubuntu-latest

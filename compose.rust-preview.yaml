@@ -1,0 +1,87 @@
+# Rust preview stack (F4.1-C): the React panel connected to the isolated
+# Rust backend. Disposable by design: its own project name, network, broker
+# and volumes; nothing is shared with the laboratory stack (separate broker,
+# so no command reaches the active simulator). Initialized explicitly by
+# scripts/test_rust_preview.py (alembic upgrade + LAB seed through the
+# `init` profile). Short confirmation TTL so uncertain operations become
+# UNKNOWN quickly in smoke scenarios.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: locker_rust
+      POSTGRES_PASSWORD: rust_test_only
+      POSTGRES_DB: locker_rust
+    volumes:
+      - rust_preview_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locker_rust -d locker_rust"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    volumes:
+      - ./infra/docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - rust_preview_mosquitto:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/broker/version' -C 1 -W 3 >/dev/null"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+
+  simulator:
+    build: ./apps/locker-simulator
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      LOCKER_ID: LAB-LOCKER-001
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+
+  init:
+    # One-shot schema and seed against the preview database, run explicitly
+    # by the smoke script (never on `up`).
+    build: ./apps/api
+    profiles: [init]
+    environment:
+      DATABASE_URL: postgresql+psycopg://locker_rust:rust_test_only@postgres:5432/locker_rust
+      APP_ENV: lab
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-rust:
+    build: ./apps/api-rust
+    environment:
+      RUST_DATABASE_URL: postgresql://locker_rust:rust_test_only@postgres:5432/locker_rust
+      RUST_BIND_ADDRESS: 0.0.0.0:8001
+      RUST_DB_MAX_CONNECTIONS: 5
+      RUST_DB_TIMEOUT_SECONDS: 3
+      RUST_MQTT_ENABLED: 'true'
+      RUST_MQTT_HOST: mosquitto
+      RUST_MQTT_PORT: 1883
+      RUST_MQTT_CLIENT_ID: locker-api-rust-preview
+      RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5
+      RUST_PRESENCE_STALE_SECONDS: 90
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+
+  web-rust:
+    build: ./apps/web
+    volumes:
+      - ./apps/web/nginx/rust.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8084:80"
+    depends_on:
+      - api-rust
+
+volumes:
+  rust_preview_postgres:
+  rust_preview_mosquitto:

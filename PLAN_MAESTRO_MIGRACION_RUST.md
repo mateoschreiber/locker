@@ -461,6 +461,41 @@ recibe la solicitud). El backend no cambió: `resolve`, elegibilidad y
 `capabilities` ya estaban validados por las 27 pruebas de integración de
 F4.0/F4.1-A.
 
+## Avance de Fase 4.1 — C: entorno aislado, pruebas y estabilización
+
+- **Entorno reproducible** `compose.rust-preview.yaml`: PostgreSQL, Mosquitto,
+  simulador, `api-rust` y `web-rust` en proyecto, red, broker y volúmenes
+  desechables propios (nada compartido con el laboratorio; el broker aislado
+  impide que un comando llegue al simulador activo). El esquema y el seed LAB
+  se inicializan explícitamente con la imagen Python (`alembic upgrade head` +
+  seed que rechaza base no vacía) y el nginx del preview
+  (`apps/web/nginx/rust.conf`) apunta a Rust **sin modificar la configuración
+  productiva**. TTL corto (5 s) para escenarios inciertos rápidos.
+- **Smoke reproducible** `scripts/test_rust_preview.py`, todo a través de
+  nginx: `/health/ready` 200, `capabilities`, login, presencia ONLINE por
+  latido del simulador real, flujo completo checkout/return confirmado,
+  pérdida del simulador (Last Will → presencia OFFLINE), UNKNOWN por TTL
+  conciliado como CONFIRMED con préstamo activo y autorización reutilizable,
+  **reinicio real de api-rust con operación en vuelo** → UNKNOWN → resolución
+  CONFIRMADA con efectos de dominio y registro de auditoría. Incorporado al
+  job `compose` de CI.
+- **Rendimiento** (ver delta en `docs/PERFORMANCE_BASELINE.md`): el ciclo
+  contra Python queda en 15 solicitudes (las capacidades se detectan una vez y
+  el panel no emite presencia ni resolve); contra Rust el ciclo es 16 — el
+  endpoint de presencia mide 6,4 ms promedio / 336 B (estado en memoria) — y
+  la vista de Operaciones no añade solicitudes.
+
+Validación local ejecutada (20-11-2026, cierre de F4.1): smoke de preview
+completo PASSED (escenarios arriba); `scripts/test_rust_mqtt.py` completo
+(flujo, duplicado, caída de broker, reinicio, coexistencia con propiedad
+única) y `scripts/test_rust_docker.py` (gate MQTT, 503 sin PostgreSQL) sobre
+imágenes reconstruidas; paridad Python/Rust completa OK (contratos compartidos
+sin cambios); Rust fmt/clippy/unitarias **8/8** e integración **27/27**
+(ejecutados en el bloque A sobre el estado final del código);
+`docker compose config` (laboratorio, perfil `rust` y preview) sin problemas;
+lint, build y pruebas web **11/11**; `git diff --check` limpio. Sin cutover:
+Python sigue atendiendo el laboratorio.
+
 ## Cierre de los tres hallazgos de Fase 0
 
 

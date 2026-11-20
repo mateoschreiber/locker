@@ -222,6 +222,34 @@ Solo se ofrece para operaciones elegibles; los rechazos del backend (401,
 implementa `resolve`: el panel lo detecta por `GET /api/v1/capabilities` y
 nunca envía esa solicitud al backend conectado si no la anuncia.
 
+## Entorno aislado Rust-preview (Fase 4.1)
+
+El panel React puede probarse completo contra el backend Rust sin tocar el
+laboratorio activo: proyecto, red, broker y volúmenes desechables propios
+(nada compartido con el stack principal; el broker aislado impide que los
+comandos lleguen al simulador del laboratorio). La base se inicializa
+explícitamente con el mismo esquema y seed del laboratorio, y el nginx del
+preview apunta a Rust mediante `apps/web/nginx/rust.conf` sin modificar la
+configuración productiva:
+
+```bash
+docker compose -f compose.rust-preview.yaml up -d
+docker compose -f compose.rust-preview.yaml run --rm init alembic upgrade head
+docker compose -f compose.rust-preview.yaml run --rm init python -m app.modules.seed
+```
+
+Abra `http://127.0.0.1:8084` (perfil de solo laboratorio, `admin`/`admin`).
+El escenario completo —capacidades, presencia, flujo de préstamo, UNKNOWN
+por TTL, conciliación con atestación y reinicio real del backend a mitad de
+operación— se valida con:
+
+```bash
+python scripts/test_rust_preview.py
+```
+
+TTL de confirmación corto (`RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5`) para que
+los escenarios inciertos sean conciliables rápidamente.
+
 ## Desarrollo
 
 Ejecute las validaciones desde cada aplicación:
