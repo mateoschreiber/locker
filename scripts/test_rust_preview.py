@@ -14,6 +14,7 @@ mid-operation reconciled as CONFIRMED with the domain effects applied.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -41,7 +42,13 @@ def call(method, path, body=None, token=None):
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, json.loads(response.read() or b'null')
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read() or b'{}')
+        # During service restarts nginx answers with plain-HTML 502 pages;
+        # the status code is what matters to the caller.
+        try:
+            body = json.loads(error.read() or b'{}')
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+        return error.code, body
     except (OSError, urllib.error.URLError):
         return None, {}
 
@@ -137,6 +144,13 @@ def main():
                        for row in rows)
         wait_until('presence OFFLINE after simulator loss', locker_offline)
 
+        # 5b. Broker loss and restart: the bridge reconnects (readiness again
+        # gated on the events subscription) and the persisted retained OFFLINE
+        # replays — an old message that can never fake freshness.
+        compose('restart', 'mosquitto')
+        wait_until('api-rust ready after broker restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180)
+        wait_until('presence OFFLINE restored by retained replay', locker_offline)
+
         status, authorization2 = call('POST', '/api/v1/authorizations', {
             'tool_id': tool['id'], 'user_id': user['id'], 'branch_id': branch['id']})
         call('POST', f"/api/v1/authorizations/{authorization2['id']}/approve")
@@ -158,7 +172,14 @@ def main():
         }, token=token)
         assert status == 200 and applied['status'] == 'CONFIRMED', applied
         assert loan_status(reusable['loan_id']) == 'ACTIVE', 'confirmed attestation did not activate the loan'
-        print('preview OK: UNKNOWN by TTL reconciled as CONFIRMED, loan active, authorization reusable')
+        # Domain transitions verified against the real state, not just the
+        # HTTP response: a correctly applied CHECKOUT keeps the authorization
+        # CONSUMED (only a revert may return it to APPROVED).
+        _, authorizations = call('GET', '/api/v1/authorizations')
+        assert next((item['status'] for item in authorizations
+                     if item['id'] == authorization2['id']), None) == 'CONSUMED', \
+            'confirmed checkout must keep the authorization consumed'
+        print('preview OK: UNKNOWN by TTL reconciled as CONFIRMED, loan active, authorization consumed')
 
         # 6. Real api-rust restart with an operation in flight (a return,
         # simulator still down): whatever the pre-restart state, recovery ends
@@ -167,7 +188,7 @@ def main():
         status, returning = call('POST', f"/api/v1/loans/{reusable['loan_id']}/return")
         assert status == 202, returning
         compose('restart', 'api-rust')
-        wait_until('api-rust ready after mid-operation restart', lambda: call('GET', '/health/ready')[0] == 200)
+        wait_until('api-rust ready after mid-operation restart', lambda: call('GET', '/health/ready')[0] == 200, seconds=180)
         wait_status(returning['id'], 'UNKNOWN', seconds=60)
         status, applied = call('POST', f"/api/v1/operations/{returning['id']}/resolve", {
             'outcome': 'CONFIRMED', 'reason': 'herramienta devuelta en sitio',
@@ -183,7 +204,8 @@ def main():
         print('Rust preview smoke: capabilities, presence, loan flow, TTL UNKNOWN, '
               'reconciliation and real restart: OK')
     finally:
-        compose('down', '-v', check=False)
+        if not os.environ.get('LOCKER_PREVIEW_KEEP'):
+            compose('down', '-v', check=False)
 
 
 if __name__ == '__main__':

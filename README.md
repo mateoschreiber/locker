@@ -240,7 +240,9 @@ docker compose -f compose.rust-preview.yaml run --rm init python -m app.modules.
 
 Abra `http://127.0.0.1:8084` (perfil de solo laboratorio, `admin`/`admin`).
 El escenario completo —capacidades, presencia, flujo de préstamo, UNKNOWN
-por TTL, conciliación con atestación y reinicio real del backend a mitad de
+por TTL, pérdida y reinicio real del broker, conciliación con atestación
+(verificando el estado efectivo del préstamo y de la autorización contra la
+base, no solo respuestas HTTP) y reinicio real del backend a mitad de
 operación— se valida con:
 
 ```bash

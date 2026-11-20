@@ -474,27 +474,33 @@ F4.0/F4.1-A.
 - **Smoke reproducible** `scripts/test_rust_preview.py`, todo a través de
   nginx: `/health/ready` 200, `capabilities`, login, presencia ONLINE por
   latido del simulador real, flujo completo checkout/return confirmado,
-  pérdida del simulador (Last Will → presencia OFFLINE), UNKNOWN por TTL
-  conciliado como CONFIRMED con préstamo activo y autorización reutilizable,
-  **reinicio real de api-rust con operación en vuelo** → UNKNOWN → resolución
-  CONFIRMADA con efectos de dominio y registro de auditoría. Incorporado al
-  job `compose` de CI.
+  pérdida del simulador (Last Will → presencia OFFLINE), **reinicio real del
+  broker** con la presencia restaurada por el replay retained persistido,
+  UNKNOWN por TTL conciliado como CONFIRMED con préstamo activo y
+  **autorización verificada CONSUMED** (solo una reversión la devuelve a
+  APPROVED), **reinicio real de api-rust con operación en vuelo** → UNKNOWN →
+  resolución CONFIRMADA con efectos de dominio y registro de auditoría.
+  Incorporado al job `compose` de CI.
 - **Rendimiento** (ver delta en `docs/PERFORMANCE_BASELINE.md`): el ciclo
   contra Python queda en 15 solicitudes (las capacidades se detectan una vez y
   el panel no emite presencia ni resolve); contra Rust el ciclo es 16 — el
   endpoint de presencia mide 6,4 ms promedio / 336 B (estado en memoria) — y
   la vista de Operaciones no añade solicitudes.
 
-Validación local ejecutada (20-11-2026, cierre de F4.1): smoke de preview
-completo PASSED (escenarios arriba); `scripts/test_rust_mqtt.py` completo
+Validación local ejecutada (20-11-2026, cierre de F4.1 y revisión técnica
+final): smoke de preview completo PASSED dos corridas consecutivas (escenarios
+arriba, incluidos los añadidos en la revisión final: autorización CONSUMED
+tras conciliar CHECKOUT UNKNOWN como CONFIRMED, y recuperación de presencia
+tras reinicio real del broker por retained persistido); la regresión Rust
+`resolve_confirmed_checkout_keeps_the_authorization_consumed` (loan ACTIVE,
+tool ON_LOAN, autorización CONSUMED, ubicación retirada) eleva la integración
+a **28/28** con fmt/clippy limpios; `scripts/test_rust_mqtt.py` completo
 (flujo, duplicado, caída de broker, reinicio, coexistencia con propiedad
 única) y `scripts/test_rust_docker.py` (gate MQTT, 503 sin PostgreSQL) sobre
 imágenes reconstruidas; paridad Python/Rust completa OK (contratos compartidos
-sin cambios); Rust fmt/clippy/unitarias **8/8** e integración **27/27**
-(ejecutados en el bloque A sobre el estado final del código);
-`docker compose config` (laboratorio, perfil `rust` y preview) sin problemas;
-lint, build y pruebas web **11/11**; `git diff --check` limpio. Sin cutover:
-Python sigue atendiendo el laboratorio.
+sin cambios); `docker compose config` (laboratorio, perfil `rust` y preview)
+sin problemas; lint, build y pruebas web **11/11**; `git diff --check`
+limpio. Sin cutover: Python sigue atendiendo el laboratorio.
 
 ## Cierre de los tres hallazgos de Fase 0
 

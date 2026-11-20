@@ -2745,3 +2745,70 @@ async fn presence_lifecycle_and_recovery_over_broker() {
     assert!(row["source"].is_string(), "{row}");
     bridge2.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn resolve_confirmed_checkout_keeps_the_authorization_consumed() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
+
+    // A CHECKOUT whose delivery became indeterminable (no broker needed:
+    // the forced UNKNOWN is exactly what a TTL or a restart produces).
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    let (status, operation) =
+        action(&app, &format!("/api/v1/authorizations/{authorization}/checkout")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
+    let operation_id = operation["id"].as_str().unwrap().to_owned();
+    let correlation = operation["correlation_id"].as_str().unwrap().to_owned();
+    force_status(&pool, &correlation, "UNKNOWN").await;
+
+    let (status, value) = resolve(
+        &app,
+        &operation_id,
+        "CONFIRMED",
+        "retiro verificado en sitio",
+        "atestación del operador",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "CONFIRMED", "{value}");
+
+    // Domain transitions applied exactly as an MQTT event would: the loan
+    // activates, the tool leaves the inventory, the origin placement is gone
+    // and the authorization stays CONSUMED — only a revert may return it to
+    // APPROVED, so the loan cannot be silently re-driven by the same
+    // authorization.
+    let loan_id: Uuid =
+        query_scalar("SELECT loan_id FROM locker_operations WHERE correlation_id = $1")
+            .bind(&correlation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM loans WHERE id = $1", loan_id).await,
+        "ACTIVE"
+    );
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM tools WHERE id = $1", lab.tool).await,
+        "ON_LOAN"
+    );
+    assert_eq!(
+        status_of(&pool, "SELECT status FROM authorizations WHERE id = $1", authorization).await,
+        "CONSUMED",
+        "a confirmed checkout must keep the authorization consumed"
+    );
+    let placements: i64 = query_scalar(
+        "SELECT COUNT(*) FROM tool_placements WHERE tool_id = $1 AND removed_at IS NULL",
+    )
+    .bind(lab.tool)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(placements, 0);
+}
