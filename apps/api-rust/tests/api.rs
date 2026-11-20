@@ -2665,12 +2665,21 @@ async fn presence_lifecycle_and_recovery_over_broker() {
     let settings = mqtt_settings();
     let (simulator, _commands) = start_simulator(&settings).await;
     let flag = Arc::new(AtomicBool::new(false));
-    let bridge = mqtt::start(pool.clone(), settings.clone(), flag.clone(), presence.clone());
+    let bridge = mqtt::start(
+        pool.clone(),
+        settings.clone(),
+        flag.clone(),
+        presence.clone(),
+    );
 
     // No data yet: every locker reads UNKNOWN with no invented values.
     let (_, value) = get(&app, "/api/v1/lockers/presence").await;
     assert!(
-        value.as_array().unwrap().iter().all(|row| row["presence"] == "UNKNOWN"),
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["presence"] == "UNKNOWN"),
         "{value}"
     );
     let row = value
@@ -2679,47 +2688,99 @@ async fn presence_lifecycle_and_recovery_over_broker() {
         .iter()
         .find(|row| row["code"] == "L2")
         .unwrap();
-    assert!(row["last_communication"].is_null() && row["age_seconds"].is_null(), "{row}");
+    assert!(
+        row["last_communication"].is_null() && row["age_seconds"].is_null(),
+        "{row}"
+    );
 
     // An old retained ONLINE is stored but never reads as connected (#15).
-    publish_status(&simulator, "L2", "LOCKER_ONLINE", &iso_seconds_ago(3600), true).await;
+    publish_status(
+        &simulator,
+        "L2",
+        "LOCKER_ONLINE",
+        &iso_seconds_ago(3600),
+        true,
+    )
+    .await;
     let row = wait_for_presence(&app, "L2", "STALE").await;
     assert!(row["last_communication"].is_string(), "{row}");
 
     // A fresh heartbeat restores ONLINE with age and source.
-    publish_status(&simulator, "L2", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    publish_status(
+        &simulator,
+        "L2",
+        "LOCKER_HEARTBEAT",
+        &iso_seconds_ago(5),
+        false,
+    )
+    .await;
     let row = wait_for_presence(&app, "L2", "ONLINE").await;
     assert!(row["age_seconds"].as_i64().unwrap() < 90, "{row}");
     assert_eq!(row["source"], "locker/L2/status", "{row}");
 
     // A known disconnect is sticky until new evidence arrives.
-    publish_status(&simulator, "L2", "LOCKER_OFFLINE", &iso_seconds_ago(1), true).await;
+    publish_status(
+        &simulator,
+        "L2",
+        "LOCKER_OFFLINE",
+        &iso_seconds_ago(1),
+        true,
+    )
+    .await;
     wait_for_presence(&app, "L2", "OFFLINE").await;
 
     // Malformed evidence changes nothing.
     simulator
-        .publish("locker/L2/status", QoS::AtLeastOnce, false, "not json".to_string())
+        .publish(
+            "locker/L2/status",
+            QoS::AtLeastOnce,
+            false,
+            "not json".to_string(),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     wait_for_presence(&app, "L2", "OFFLINE").await;
 
     // "L1" exists in two branches: presence is never attributed (#9).
-    publish_status(&simulator, "L1", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    publish_status(
+        &simulator,
+        "L1",
+        "LOCKER_HEARTBEAT",
+        &iso_seconds_ago(5),
+        false,
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (_, value) = get(&app, "/api/v1/lockers/presence").await;
-    for row in value.as_array().unwrap().iter().filter(|row| row["code"] == "L1") {
+    for row in value
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["code"] == "L1")
+    {
         assert_eq!(row["presence"], "UNKNOWN", "{row}");
         assert_eq!(row["ambiguous_code"], true, "{row}");
         assert!(row["last_communication"].is_null(), "{row}");
     }
 
     // Unknown codes never surface: only real lockers are listed.
-    publish_status(&simulator, "NOPE", "LOCKER_HEARTBEAT", &iso_seconds_ago(5), false).await;
+    publish_status(
+        &simulator,
+        "NOPE",
+        "LOCKER_HEARTBEAT",
+        &iso_seconds_ago(5),
+        false,
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (_, value) = get(&app, "/api/v1/lockers/presence").await;
     assert!(
-        value.as_array().unwrap().iter().all(|row| row["code"] != "NOPE"),
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["code"] != "NOPE"),
         "{value}"
     );
 
@@ -2761,8 +2822,11 @@ async fn resolve_confirmed_checkout_keeps_the_authorization_consumed() {
         &format!("/api/v1/authorizations/{authorization}/approve"),
     )
     .await;
-    let (status, operation) =
-        action(&app, &format!("/api/v1/authorizations/{authorization}/checkout")).await;
+    let (status, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{operation}");
     let operation_id = operation["id"].as_str().unwrap().to_owned();
     let correlation = operation["correlation_id"].as_str().unwrap().to_owned();
@@ -2799,7 +2863,12 @@ async fn resolve_confirmed_checkout_keeps_the_authorization_consumed() {
         "ON_LOAN"
     );
     assert_eq!(
-        status_of(&pool, "SELECT status FROM authorizations WHERE id = $1", authorization).await,
+        status_of(
+            &pool,
+            "SELECT status FROM authorizations WHERE id = $1",
+            authorization
+        )
+        .await,
         "CONSUMED",
         "a confirmed checkout must keep the authorization consumed"
     );

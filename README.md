@@ -230,16 +230,34 @@ laboratorio activo: proyecto, red, broker y volúmenes desechables propios
 comandos lleguen al simulador del laboratorio). La base se inicializa
 explícitamente con el mismo esquema y seed del laboratorio, y el nginx del
 preview apunta a Rust mediante `apps/web/nginx/rust.conf` sin modificar la
-configuración productiva:
+configuración productiva.
 
-```bash
-docker compose -f compose.rust-preview.yaml up -d
-docker compose -f compose.rust-preview.yaml run --rm init alembic upgrade head
-docker compose -f compose.rust-preview.yaml run --rm init python -m app.modules.seed
+### Uso interactivo (Windows)
+
+`scripts/rust-preview.ps1` gestiona el preview desde cualquier directorio de
+PowerShell; el laboratorio Python (puerto 8083) permanece independiente e
+intacto:
+
+```powershell
+.\scripts\rust-preview.ps1 start    # levanta y espera readiness; inicializa
+                                   # esquema + seed LAB solo la primera vez
+                                   # (nunca re-sembrará una base con datos)
+.\scripts\rust-preview.ps1 stop     # detiene conservando los datos
+.\scripts\rust-preview.ps1 status   # contenedores y salud del preview
+.\scripts\rust-preview.ps1 init     # inicialización explícita (el seed
+                                   # rechaza bases no vacías)
+.\scripts\rust-preview.ps1 reset    # destrucción explícita de datos y
+                                   # volúmenes (solo cuando se desea)
 ```
 
-Abra `http://127.0.0.1:8084` (perfil de solo laboratorio, `admin`/`admin`).
-El escenario completo —capacidades, presencia, flujo de préstamo, UNKNOWN
+Con el preview iniciado, abra `http://127.0.0.1:8084` (perfil de solo
+laboratorio, `admin`/`admin`): presencia observada de los lockers, vista de
+Operaciones y conciliación administrativa contra Rust. Una parada normal
+conserva los datos; `reset` es la única acción que los elimina.
+
+### Escenario automatizado
+
+El ciclo completo —capacidades, presencia, flujo de préstamo, UNKNOWN
 por TTL, pérdida y reinicio real del broker, conciliación con atestación
 (verificando el estado efectivo del préstamo y de la autorización contra la
 base, no solo respuestas HTTP) y reinicio real del backend a mitad de
@@ -249,8 +267,11 @@ operación— se valida con:
 python scripts/test_rust_preview.py
 ```
 
-TTL de confirmación corto (`RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5`) para que
-los escenarios inciertos sean conciliables rápidamente.
+Ese smoke mantiene su ciclo de vida desechable propio (`down -v`) y no
+interfiere con el uso interactivo; `LOCKER_PREVIEW_KEEP=1` lo conserva
+levanto para depuración. TTL de confirmación corto
+(`RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5`) para que los escenarios inciertos
+sean conciliables rápidamente.
 
 ## Desarrollo
 

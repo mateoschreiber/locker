@@ -486,6 +486,11 @@ F4.0/F4.1-A.
   el panel no emite presencia ni resolve); contra Rust el ciclo es 16 — el
   endpoint de presencia mide 6,4 ms promedio / 336 B (estado en memoria) — y
   la vista de Operaciones no añade solicitudes.
+- **Uso interactivo del preview** (`scripts/rust-preview.ps1`, Windows):
+  `start`/`stop`/`status`/`init`/`reset` desde cualquier directorio; el seed
+  se aplica solo la primera vez (detecta el esquema, nunca re-siembra una
+  base con datos), la parada normal conserva volúmenes y `reset` es la única
+  acción destructiva. El smoke de CI conserva su ciclo desechable propio.
 
 Validación local ejecutada (20-11-2026, cierre de F4.1 y revisión técnica
 final): smoke de preview completo PASSED dos corridas consecutivas (escenarios
