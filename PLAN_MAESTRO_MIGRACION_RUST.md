@@ -558,13 +558,13 @@ cutover: Python sigue conectado al laboratorio; Rust permanece aislado.
   de tests web y el smoke del preview incorporado al job `compose`).
 - Riesgos abiertos sin cambios: autenticación/token fijo y MQTT anónimo sin
   TLS (#1/#3), almacenamiento de contraseñas en claro (#2) — F5; presencia
-  en memoria con crecimiento por código visto (atajo documentado) — F5;
-  paginación y carga por vista (#13) — F4.2.
-- Próximo bloque: **F4.2** — paginación y carga por vista sobre la línea
-  base de `docs/PERFORMANCE_BASELINE.md` (el ciclo contra Rust es 16
-  solicitudes; contra Python queda en 15), unificación de convenciones del
-  panel, y medición comparada antes del cutover. El cutover y la retirada de
-  Python siguen siendo condiciones explícitas posteriores a F4.2.
+  en memoria con crecimiento por código visto (atajo documentado) — F5.
+  **#13 (paginación y carga por vista) cerrado en F4.2**, con línea base
+  y medición comparada en `docs/PERFORMANCE_BASELINE.md`.
+- F4.2 completa localmente (ver su sección). Próximo bloque: **F4.3** —
+  Rust como backend principal del panel del laboratorio. El cutover de
+  datos y la retirada de Python siguen siendo condiciones explícitas de
+  F4.4.
 
 ## Cierre de los tres hallazgos de Fase 0
 
@@ -766,3 +766,71 @@ commit en main → push opcional → CI remoto manual cuando se desee.
   reiniciar su nginx. Fuera del alcance de este bloque (el laboratorio no
   se toca); a considerar en F4.3 cuando Rust pase a ser el backend
   principal del panel.
+
+## F4.2 — paginación, carga por vista y medición comparada (20-11-2026)
+
+### Qué se implementó
+
+- **Backend (A):** paginación opt-in en el manejador genérico de listados
+  (`limit` 1..=200 / `offset` ≥ 0, 422 explícitos; sin `limit` el array
+  completo legado queda byte-idéntico para paridad y consumidores
+  existentes) con orden determinístico `created_at DESC, id DESC`.
+  `GET /operations?limit` responde el envoltorio con filas enriquecidas en
+  una única consulta JOIN (sin N+1: `tool_name`, `locker_code`,
+  `compartment_code`, `user_display_name`, `loan_status`,
+  `requires_intervention`) y el filtro `attention=1|0` que replica la
+  elegibilidad de `resolve`. `GET /capabilities` añade `pagination` y
+  `enriched_operations`.
+- **Panel (B):** `apps/web/src/polling.ts` (sondeo por vista sin ciclos
+  superpuestos, abort de respuestas obsoletas al cambiar de vista,
+  suspensión en pestaña oculta con refresco al volver, búsqueda con
+  retardo). `App.tsx` consulta solo los datos de la vista activa (≤3
+  dinámicas; administracion 0), mantiene referencias en caché refrescadas
+  tras mutaciones, consume el envoltorio y el enriquecido cuando el backend
+  los anuncia y degrada al contrato legado contra Python. Nombres/códigos
+  legibles en tablas (UUID accesible al pasar el cursor; identificadores
+  técnicos intactos en el detalle de operación) — cierra el hallazgo 2 de
+  la revisión de F4.1. Estados de carga/vacío/desactualizado explícitos.
+- **Medición (C):** `scripts/bench_panel.py` (stack desechable propio,
+  puerto 8086; `up`/`inflate`/`cycle [--view]`/`down`) sobre el mismo
+  Compose del preview. **Baseline Rust pre-F4.2** y **Delta F4.2** con
+  datasets 1x/10x/100x en `docs/PERFORMANCE_BASELINE.md`. Cifras
+  observadas clave (HTTP sintético, no métricas de navegador): ciclo
+  completo 16 solicitudes/~31 KB → por vista ≤3/≤6,1 KB; auditoría a
+  24 000 filas: 227,5 ms/6,0 MB → **14,6 ms p95 28,7/25,3 KB** (p95 −89 %,
+  bytes −99,6 %); api-rust de picos ~22 %/80-129 MiB a plano ~0,2-0,7 %/
+  ~6 MiB. Cierre del hallazgo #13.
+
+### Defectos detectados por la validación propia y corregidos en el bloque
+
+1. `#[serde(flatten)]` en `Query` de axum no es soportado: `/operations?limit`
+   respondía el rechazo del extractor (texto plano 400) — detectado por las
+   pruebas de integración nuevas antes de llegar al panel; campos
+   explícitos.
+2. Paréntesis desbalanceado en el filtro `attention=0` (500 de SQL) —
+   detectado por la prueba de integración que cubre ambas direcciones.
+3. Revisión final pre-commit: el sondeo de presencia reportaba aborts como
+   errores (banner espurio al cambiar de vista); filtrado de `AbortError`
+   como en `fetchEntities`, revalidado con QUICK.
+
+### Validación
+
+- Rust: fmt ✔, clippy `-D warnings` ✔, 12 unitarias (1 nueva de
+  validación de paginación) ✔; **integración 32/32 en FULL** (4 nuevas:
+  envoltorio vs legado, desempate determinístico, enriquecido+attention en
+  ambas direcciones, sondeo paginado durante checkouts concurrentes).
+- Web: lint ✔, build ✔, **19 pruebas** (de 16; nuevas: solo dependencias
+  de la vista activa, refresco tras mutación, carga vs vacío, sin
+  solapamiento, pestaña oculta, envoltorio paginado, hero con lista de
+  atención del servidor, enriquecido del servidor).
+- **QUICK: 8 PASS / 0 FAIL (66,9 s).**
+- **FULL: 16 PASS / 0 FAIL (290,4 s)** — paridad completa Python/Rust
+  intacta (el contrato legado sigue byte-idéntico), laboratorio Python
+  funcional, 5 escenarios MQTT, smoke de imagen, regresión de reinicio.
+- **E2E: 20 PASS / 0 FAIL (291,6 s)** — FULL más guardián desechable
+  (`locker-rust-preview-guard`) con marcador de persistencia
+  `1/24/3/0/0/1` antes y después del smoke completo contra las imágenes
+  reconstruidas con F4.2; laboratorio 8083 con salud invariada y datos
+  nunca tocados; preview interactivo 8084 con sus datos preservados
+  (`1/24/3/0/0`). El smoke validó presencia, flujo de préstamo confirmado
+  por el simulador, UNKNOWN por TTL conciliado y reinicio mid-operation.

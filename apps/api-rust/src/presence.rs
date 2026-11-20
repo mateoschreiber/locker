@@ -181,7 +181,12 @@ pub async fn lockers_presence(
 /// does not implement this route (404 → features off); never send resolve or
 /// presence requests to a backend that does not advertise them.
 pub async fn capabilities() -> Json<Value> {
-    Json(json!({ "resolve": true, "presence": true }))
+    Json(json!({
+        "resolve": true,
+        "presence": true,
+        "pagination": true,
+        "enriched_operations": true,
+    }))
 }
 
 #[cfg(test)]

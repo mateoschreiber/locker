@@ -1,6 +1,6 @@
 use axum::{http::StatusCode, Json};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, query, query_scalar, PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
@@ -14,16 +14,47 @@ use crate::json::ValidJson;
 pub struct ListParams {
     pub q: Option<String>,
     pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
-/// GET /{entity}?q=&status= — ordered by created_at DESC, like Python's `list_items`.
-pub async fn list(
-    spec: &'static Entity,
-    pool: PgPool,
-    params: ListParams,
-) -> Result<Json<Value>, ApiError> {
-    let mut builder = QueryBuilder::<Postgres>::new("SELECT * FROM ");
-    builder.push(spec.table);
+/// Maximum page size: bounded so a caller can never demand the whole table
+/// through the paginated contract (the legacy full-array one still exists).
+pub const MAX_PAGE_SIZE: i64 = 200;
+
+/// Validated pagination. `None` keeps the legacy full-array contract;
+/// `Some` answers the explicit `{items, total, limit, offset}` envelope.
+/// `offset` without `limit` is a 422, never a silently ignored param.
+pub struct Page {
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub fn page(params: &ListParams) -> Result<Option<Page>, ApiError> {
+    let Some(limit) = params.limit else {
+        if params.offset.is_some() {
+            return Err(ApiError::validation("Campo 'offset': requiere limit"));
+        }
+        return Ok(None);
+    };
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ApiError::validation(&format!(
+            "Campo 'limit': entre 1 y {}",
+            MAX_PAGE_SIZE
+        )));
+    }
+    let offset = params.offset.unwrap_or(0);
+    if offset < 0 {
+        return Err(ApiError::validation(
+            "Campo 'offset': debe ser mayor o igual a 0",
+        ));
+    }
+    Ok(Some(Page { limit, offset }))
+}
+
+/// Shared WHERE construction so the page query and its COUNT always filter
+/// identically. Returns nothing: `has_where` is recomputed per builder.
+fn push_filters(builder: &mut sqlx::QueryBuilder<Postgres>, spec: &Entity, params: &ListParams) {
     let mut has_where = false;
     if spec.has_status {
         if let Some(status) = &params.status {
@@ -46,9 +77,46 @@ pub async fn list(
             builder.push(")");
         }
     }
-    builder.push(" ORDER BY created_at DESC");
-    let rows: Vec<PgRow> = builder.build().fetch_all(&pool).await?;
-    Ok(Json(Value::Array(rows.iter().map(dump_row).collect())))
+}
+
+/// GET /{entity}?q=&status=&limit=&offset= — ordered by created_at DESC with
+/// an id tiebreak (rows seeded in one transaction share created_at, so the
+/// old order was nondeterministic). Without `limit` the response stays the
+/// legacy full array (Python parity consumers); with it, the paginated
+/// envelope. The COUNT runs the same WHERE as the page.
+pub async fn list(
+    spec: &'static Entity,
+    pool: PgPool,
+    params: ListParams,
+) -> Result<Json<Value>, ApiError> {
+    let page = page(&params)?;
+    let mut builder = QueryBuilder::<Postgres>::new("SELECT * FROM ");
+    builder.push(spec.table);
+    push_filters(&mut builder, spec, &params);
+    builder.push(" ORDER BY created_at DESC, id DESC");
+    match page {
+        None => {
+            let rows: Vec<PgRow> = builder.build().fetch_all(&pool).await?;
+            Ok(Json(Value::Array(rows.iter().map(dump_row).collect())))
+        }
+        Some(page) => {
+            builder.push(" LIMIT ").push_bind(page.limit);
+            builder.push(" OFFSET ").push_bind(page.offset);
+            let rows: Vec<PgRow> = builder.build().fetch_all(&pool).await?;
+            let mut count_builder = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM ");
+            count_builder.push(spec.table);
+            push_filters(&mut count_builder, spec, &params);
+            // shortcut: one COUNT per paginated poll; fine at lab scale,
+            // revisit with an index-free keyset cursor if growth measurements demand it
+            let total: i64 = count_builder.build().fetch_one(&pool).await?.try_get(0)?;
+            Ok(Json(json!({
+                "items": rows.iter().map(dump_row).collect::<Vec<_>>(),
+                "total": total,
+                "limit": page.limit,
+                "offset": page.offset,
+            })))
+        }
+    }
 }
 
 /// Validates a manually written status against the entity's allowed list
@@ -339,4 +407,41 @@ async fn fetch_row(
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| ApiError::not_found("Registro no encontrado"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(limit: Option<i64>, offset: Option<i64>) -> ListParams {
+        ListParams {
+            q: None,
+            status: None,
+            limit,
+            offset,
+        }
+    }
+
+    #[test]
+    fn page_contract_validation() {
+        // Without limit the legacy full-array contract stays (None).
+        assert!(matches!(page(&params(None, None)), Ok(None)));
+        // offset without limit is an explicit 422, never a silent ignore.
+        assert!(page(&params(None, Some(5))).is_err());
+        let Ok(Some(paged)) = page(&params(Some(50), None)) else {
+            panic!("valid limit rejected");
+        };
+        assert_eq!((paged.limit, paged.offset), (50, 0));
+        let Ok(Some(paged)) = page(&params(Some(200), Some(30))) else {
+            panic!("max limit with offset rejected");
+        };
+        assert_eq!((paged.limit, paged.offset), (200, 30));
+        for bad in [0, -1, 201, i64::MAX] {
+            assert!(
+                page(&params(Some(bad), None)).is_err(),
+                "limit {bad} accepted"
+            );
+        }
+        assert!(page(&params(Some(10), Some(-1))).is_err());
+    }
 }

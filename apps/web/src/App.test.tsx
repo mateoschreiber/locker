@@ -34,9 +34,18 @@ function jsonResponse(body: unknown, ok = true) {
 
 type Mutation = () => { ok: boolean; body: unknown }
 
+/** Mirrors the backend intervention rule for `attention=1` listings. */
+function needsAttention(operation: Item, data: Data) {
+  const loan = (data.loans ?? []).find((candidate) => candidate.id === operation.loan_id)
+  return operation.status === 'UNKNOWN'
+    || (operation.status === 'FAILED' && ['CHECKOUT_PENDING', 'RETURN_PENDING'].includes(String(loan?.status)))
+}
+
 /** Stub of the API: entity lists from `data`, deferred URLs answered by the
  * test (honoring AbortSignal like a real fetch). `capabilities` emulates the
- * Rust backend feature detection (absent → 404 like the Python backend). */
+ * Rust backend feature detection (absent → 404 like the Python backend); with
+ * `pagination` the query-string URLs answer the Rust envelope, applying the
+ * same server-side filters the real backend does. */
 function stubApi(data: Data, options?: {
   deferred?: string[]
   mutation?: Mutation
@@ -81,7 +90,31 @@ function stubApi(data: Data, options?: {
         const mutation = options?.mutation?.() ?? { ok: true, body: {} }
         return jsonResponse(mutation.body, mutation.ok)
       }
-      const entity = url.replace('/api/v1/', '').split('?')[0]
+      const [entity, query] = url.replace('/api/v1/', '').split('?')
+      let items = data[entity] ?? []
+      if (query && options?.capabilities?.pagination) {
+        const params = new URLSearchParams(query)
+        // Server-side contracts the real Rust backend applies.
+        if (params.get('status')) items = items.filter((item) => item.status === params.get('status'))
+        if (entity === 'operations' && params.get('attention') === '1')
+          items = items.filter((operation) => needsAttention(operation, data))
+        if (entity === 'operations' && options.capabilities.enriched_operations) {
+          const byId = (resource: string, id: unknown) => (data[resource] ?? []).find((item) => item.id === id)
+          items = items.map((operation) => {
+            const loan = byId('loans', operation.loan_id)
+            return {
+              ...operation,
+              tool_name: String(byId('tools', operation.tool_id)?.name ?? ''),
+              locker_code: String(byId('lockers', operation.locker_id)?.code ?? ''),
+              compartment_code: String(byId('compartments', operation.compartment_id)?.code ?? ''),
+              user_display_name: String(byId('users', loan?.user_id)?.display_name ?? ''),
+              loan_status: String(loan?.status ?? ''),
+              requires_intervention: needsAttention(operation, data),
+            }
+          })
+        }
+        return jsonResponse({ items, total: items.length, limit: Number(params.get('limit')), offset: Number(params.get('offset') ?? 0) })
+      }
       return jsonResponse(data[entity] ?? [])
     }),
   )
@@ -98,15 +131,145 @@ async function enterPanel(data: Data, options?: {
   render(<App />)
   const form = screen.getByRole('button', { name: 'Ingresar al panel' }).closest('form')!
   fireEvent.submit(form)
-  // 'TOOL_PLACED' viene de data.audit, que solo existe cuando `load()` terminó.
-  await waitFor(() => expect(screen.getByText('TOOL_PLACED')).toBeTruthy())
+  // La vista inicial pinta la actividad reciente que llega en /dashboard.
+  await waitFor(() => expect(screen.getByText('LOGIN')).toBeTruthy())
   return api
 }
 
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  // The hidden-tab test shadows document.visibilityState; restore the getter.
+  delete (document as unknown as Record<string, unknown>).visibilityState
 })
+
+// ---------------------------------------------------------------------------
+// F4.2-B: per-view loading — only the active view's dependencies are polled.
+// ---------------------------------------------------------------------------
+
+test('la vista activa consulta solo sus dependencias y cambia con ella', async () => {
+  const data = fixture()
+  const api = await enterPanel(data) // sin capabilities: como el backend Python
+  const urls = new Set(api.calls.map(({ url }) => url))
+  // inicio (modo Python): dashboard + fallback del hero; más las referencias.
+  for (const present of ['/api/v1/dashboard', '/api/v1/operations', '/api/v1/loans', '/api/v1/branches', '/api/v1/roles', '/api/v1/users', '/api/v1/lockers', '/api/v1/compartments']) {
+    expect(urls.has(present), present).toBe(true)
+  }
+  // Nada de lo que ninguna vista en pantalla necesita.
+  for (const absent of ['/api/v1/tools', '/api/v1/placements', '/api/v1/audit', '/api/v1/memberships', '/api/v1/cameras']) {
+    expect(urls.has(absent), absent).toBe(false)
+  }
+
+  // Cambio de vista: el sondeo pasa a consultar lo que esa vista necesita.
+  fireEvent.click(screen.getByRole('button', { name: /Inventario/ }))
+  await waitFor(() => expect(api.calls.some(({ url }) => url === '/api/v1/tools')).toBe(true))
+  expect(api.calls.every(({ url }) => url !== '/api/v1/audit')).toBe(true)
+})
+
+test('una mutación refresca la vista activa y sus referencias, no el laboratorio entero', async () => {
+  const data = fixture()
+  const api = await enterPanel(data, { mutation: () => ({ ok: true, body: {} }) })
+  fireEvent.click(screen.getByRole('button', { name: /Operación$/ }))
+  await waitFor(() => expect(screen.getByRole('option', { name: /TOOL-001/ })).toBeTruthy())
+  const authorizationsBefore = api.calls.filter(({ url }) => url === '/api/v1/authorizations').length
+  const branchesBefore = api.calls.filter(({ url }) => url === '/api/v1/branches').length
+  fireEvent.change(screen.getByLabelText('Herramienta'), { target: { value: 't1' } })
+  fireEvent.change(screen.getByLabelText('Usuario'), { target: { value: 'u1' } })
+  fireEvent.click(screen.getByText('Crear autorización'))
+  await waitFor(() =>
+    expect(api.calls.filter(({ url }) => url === '/api/v1/authorizations').length).toBeGreaterThan(authorizationsBefore))
+  expect(api.calls.filter(({ url }) => url === '/api/v1/branches').length).toBeGreaterThan(branchesBefore)
+  // Lo que ninguna vista en pantalla usa no se consulta por la mutación.
+  expect(api.calls.every(({ url }) => url !== '/api/v1/audit')).toBe(true)
+})
+
+test('la primera carga muestra el estado de carga y luego el vacío explícito', async () => {
+  const data = fixture()
+  data.audit = []
+  const api = await enterPanel(data, { deferred: ['/api/v1/audit'] })
+  fireEvent.click(screen.getByRole('button', { name: /Actividad/ }))
+  expect(screen.getByText('Cargando…')).toBeTruthy()
+  api.resolvers.get('/api/v1/audit')!([])
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Auditoría' })).getByText('Sin registros.')).toBeTruthy())
+})
+
+test('un ciclo sin respuesta no se solapa con el siguiente', async () => {
+  const data = fixture()
+  const api = await enterPanel(data, { deferred: ['/api/v1/operations'] })
+  // La vista inicio (modo Python) también consulta operations: se mide el
+  // delta desde el cambio de vista, no el total de la sesión.
+  const before = api.calls.filter(({ url }) => url === '/api/v1/operations').length
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  // El primer ciclo de la vista queda pendiente: los siguientes se descartan.
+  await new Promise((resolve) => setTimeout(resolve, 9000))
+  expect(api.calls.filter(({ url }) => url === '/api/v1/operations').length - before).toBe(1)
+  api.resolvers.get('/api/v1/operations')!([])
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Operaciones' })).getByText('Sin registros.')).toBeTruthy())
+}, 20000)
+
+test('la pestaña oculta suspende el sondeo y al volver refresca de inmediato', async () => {
+  const data = fixture()
+  const api = await enterPanel(data)
+  Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+  document.dispatchEvent(new Event('visibilitychange'))
+  const paused = api.calls.length
+  // Suficiente para que el intervalo de 4 s hubiera disparado si no se hubiera detenido.
+  await new Promise((resolve) => setTimeout(resolve, 4500))
+  expect(api.calls.length).toBe(paused)
+  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+  document.dispatchEvent(new Event('visibilitychange'))
+  await waitFor(() => expect(api.calls.length).toBeGreaterThan(paused))
+}, 15000)
+
+// ---------------------------------------------------------------------------
+// F4.2-A/B together: Rust mode consumes the paginated envelope, the
+// server-side attention list and the enriched operations without polling
+// the reference tables.
+// ---------------------------------------------------------------------------
+
+test('el modo Rust consulta el hero con la lista de atención del servidor', async () => {
+  const data = fixture()
+  data.operations = [{ id: 'op1', status: 'UNKNOWN', command_type: 'RETURN', tool_id: 't1', loan_id: 'l1', created_at: '2026-01-01T00:00:00Z' }]
+  const api = await enterPanel(data, { capabilities: { resolve: true, presence: true, pagination: true, enriched_operations: true } })
+  expect(screen.getByText('Atención requerida')).toBeTruthy()
+  expect(api.calls.some(({ url }) => url === '/api/v1/operations?attention=1&limit=100')).toBe(true)
+  // El hero ya no sondea operations ni loans completos contra Rust.
+  expect(api.calls.every(({ url }) => url !== '/api/v1/operations')).toBe(true)
+  expect(api.calls.every(({ url }) => url !== '/api/v1/loans')).toBe(true)
+})
+
+test('la búsqueda del inventario consulta al servidor en modo Rust', async () => {
+  const data = fixture()
+  const api = await enterPanel(data, { capabilities: { resolve: true, presence: true, pagination: true, enriched_operations: true } })
+  fireEvent.click(screen.getByRole('button', { name: /Inventario/ }))
+  await waitFor(() => expect(api.calls.some(({ url }) => url === '/api/v1/tools?status=AVAILABLE&limit=100')).toBe(true))
+  // El filtro de estado es del servidor: el activo en préstamo no llega.
+  await waitFor(() => expect(screen.getByText('TOOL-001')).toBeTruthy())
+  expect(screen.queryByText('TOOL-003')).toBeNull()
+  fireEvent.change(screen.getByLabelText('Buscar herramienta'), { target: { value: 'TAL' } })
+  await waitFor(() => expect(api.calls.some(({ url }) => url.includes('/api/v1/tools?status=AVAILABLE&q=TAL&limit=100'))).toBe(true))
+})
+
+test('el panel de operaciones en modo Rust consume el enriquecimiento del servidor', async () => {
+  const data = operationsFixture()
+  const api = await enterPanel(data, { capabilities: { resolve: true, presence: true, pagination: true, enriched_operations: true } })
+  fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  await waitFor(() => expect(screen.getByText('Taladro')).toBeTruthy())
+  expect(api.calls.some(({ url }) => url === '/api/v1/operations?limit=100')).toBe(true)
+  // Una sola consulta: ni tools ni loans para enriquecer las filas.
+  expect(api.calls.every(({ url }) => url !== '/api/v1/tools')).toBe(true)
+  expect(api.calls.every(({ url }) => url !== '/api/v1/loans')).toBe(true)
+  // La regla de intervención llega del servidor (requires_intervention).
+  const failed = within(screen.getByText('Llave').closest('tr')!)
+  expect(failed.getByText('⚠')).toBeTruthy()
+  const confirmed = within(screen.getByText('Taladro').closest('tr')!)
+  expect(confirmed.queryByText('⚠')).toBeNull()
+})
+
+// ---------------------------------------------------------------------------
+// Comportamiento conservado de las vistas (historial, administración,
+// presencia, conciliación) bajo la nueva arquitectura de sondeo.
+// ---------------------------------------------------------------------------
 
 test('el historial muestra solo la herramienta seleccionada y responde en orden invertido', async () => {
   const data = fixture()
@@ -114,6 +277,7 @@ test('el historial muestra solo la herramienta seleccionada y responde en orden 
     deferred: ['/api/v1/tools/t1/history', '/api/v1/tools/t2/history'],
   })
   fireEvent.click(screen.getByRole('button', { name: /Inventario/ }))
+  await waitFor(() => expect(screen.getByText('TOOL-001')).toBeTruthy())
   fireEvent.click(screen.getByText('TOOL-001'))
   await waitFor(() => expect(api.resolvers.get('/api/v1/tools/t1/history')).toBeTruthy())
 
@@ -142,6 +306,7 @@ test('el historial vacío muestra su estado explícito', async () => {
   const data = fixture()
   await enterPanel(data)
   fireEvent.click(screen.getByRole('button', { name: /Inventario/ }))
+  await waitFor(() => expect(screen.getByText('TOOL-001')).toBeTruthy())
   fireEvent.click(screen.getByText('TOOL-001'))
   await waitFor(() => expect(screen.getByText('Sin movimientos registrados.')).toBeTruthy())
   expect(screen.queryByText('locker-A')).toBeNull()
@@ -151,7 +316,10 @@ test('editar estado envía el PATCH y oculta controles de estados de dominio', a
   const data = fixture()
   const api = await enterPanel(data)
   fireEvent.click(screen.getByRole('button', { name: /Administración/ }))
+  // La entidad por defecto es branches: la tabla muestra la sucursal LAB.
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Sucursales' })).getByText('LAB')).toBeTruthy())
   fireEvent.change(screen.getByLabelText('Entidad'), { target: { value: 'tools' } })
+  await waitFor(() => expect(screen.getByText('TOOL-001')).toBeTruthy())
 
   // La herramienta disponible ofrece la lista administrativa de estados.
   const available = within(screen.getByText('TOOL-001').closest('tr')!)
@@ -175,7 +343,9 @@ test('los errores del backend se muestran al usuario', async () => {
     mutation: () => ({ ok: false, body: { detail: 'La herramienta tiene un préstamo activo o pendiente' } }),
   })
   fireEvent.click(screen.getByRole('button', { name: /Administración/ }))
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Sucursales' })).getByText('LAB')).toBeTruthy())
   fireEvent.change(screen.getByLabelText('Entidad'), { target: { value: 'tools' } })
+  await waitFor(() => expect(screen.getByText('TOOL-001')).toBeTruthy())
   fireEvent.change(within(screen.getByText('TOOL-001').closest('tr')!).getByLabelText('Estado'), { target: { value: 'INACTIVE' } })
   await waitFor(() =>
     expect(screen.getByText('La herramienta tiene un préstamo activo o pendiente')).toBeTruthy(),
@@ -208,10 +378,11 @@ test('la presencia observada se muestra solo cuando el backend la soporta', asyn
   ]
   await enterPanel(data, { capabilities: { resolve: true, presence: true }, presence: presenceRows() })
   fireEvent.click(screen.getByRole('button', { name: /Lockers/ }))
+  await waitFor(() => expect(screen.getByText('LAB-LOCKER-001')).toBeTruthy())
 
   // Estado administrativo y presencia observada conviven por fila. Ambos
-  // llegan por cadenas asíncronas independientes (load, capabilities y el
-  // poll de presencia): se espera la condición funcional, no un retardo.
+  // llegan por cadenas asíncronas independientes: se espera la condición
+  // funcional, no un retardo.
   await waitFor(() => {
     const online = within(screen.getByText('LAB-LOCKER-001').closest('tr')!)
     expect(online.getAllByText('ONLINE').length).toBe(2)
@@ -230,6 +401,7 @@ test('el backend sin capacidad de presencia no recibe la solicitud', async () =>
   data.lockers = [{ id: 'k1', code: 'LAB-LOCKER-001', name: 'Locker principal', status: 'ONLINE' }]
   const api = await enterPanel(data) // sin capabilities: como el backend Python
   fireEvent.click(screen.getByRole('button', { name: /Lockers/ }))
+  await waitFor(() => expect(screen.getByText('LAB-LOCKER-001')).toBeTruthy())
   expect(screen.queryByText('presence')).toBeNull()
   expect(screen.queryByText('last communication')).toBeNull()
   expect(api.calls.every(({ url }) => !url.includes('lockers/presence'))).toBe(true)
@@ -244,7 +416,7 @@ test('el dashboard no muestra todo listo mientras exista una intervención', asy
   }]
   data.loans = [{ id: 'l1', status: 'RETURN_PENDING', tool_id: 't1', user_id: 'u1' }]
   await enterPanel(data, { capabilities: { resolve: true, presence: true }, presence: presenceRows() })
-  expect(screen.getByText('Atención requerida')).toBeTruthy()
+  await waitFor(() => expect(screen.getByText('Atención requerida')).toBeTruthy())
 
   // Sin condiciones pendientes, el estado vuelve a estar listo.
   const clean = fixture()
@@ -254,7 +426,7 @@ test('el dashboard no muestra todo listo mientras exista una intervención', asy
 })
 
 // ---------------------------------------------------------------------------
-// F4.1-B: operations supervision and reconciliation.
+// F4.1-B: operations supervision and reconciliation (Python fallback mode).
 // ---------------------------------------------------------------------------
 
 function operationsFixture(): Data {
@@ -281,9 +453,9 @@ test('el panel de operaciones enriquece, filtra y concilia con el veredicto real
     mutation: () => ({ ok: true, body: { status: 'FAILED', failure_reason: 'Compartment is occupied' } }),
   })
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  await waitFor(() => expect(screen.getByText('Taladro')).toBeTruthy())
 
   // Nombres y códigos legibles; las que requieren atención van primero.
-  expect(screen.getByText('Taladro')).toBeTruthy()
   expect(screen.queryByText(/^[0-9a-f]{8}-/)).toBeNull()
   const failed = within(screen.getByText('Llave').closest('tr')!)
   expect(failed.getByText('⚠')).toBeTruthy()
@@ -297,9 +469,7 @@ test('el panel de operaciones enriquece, filtra y concilia con el veredicto real
   expect(screen.getByText('Taladro')).toBeTruthy()
   fireEvent.change(screen.getByLabelText('Filtro'), { target: { value: 'ALL' } })
 
-  // Detalle con la traza completa y formulario solo para la elegible. La
-  // elegibilidad es inmediata, pero el formulario además requiere la
-  // detección asíncrona de capacidades: se espera la condición funcional.
+  // Detalle con la traza completa y formulario solo para la elegible.
   fireEvent.click(screen.getByText('Llave'))
   const detail = screen.getByText(/Correlación/).parentElement!
   expect(detail.textContent).toContain('corr-2')
@@ -330,9 +500,9 @@ test('solo las operaciones elegibles ofrecen conciliación', async () => {
   const data = operationsFixture()
   await enterPanel(data, { capabilities: { resolve: true, presence: true } })
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  await waitFor(() => expect(screen.getByText('Taladro')).toBeTruthy())
 
-  // CONFIRMED: terminal, nada que conciliar. La leyenda que lo explica
-  // depende de la detección asíncrona de capacidades: condición funcional.
+  // CONFIRMED: terminal, nada que conciliar.
   fireEvent.click(screen.getByText('Taladro'))
   await waitFor(() => expect(screen.getByText(/no es conciliable/)).toBeTruthy())
   expect(screen.queryByText('Conciliar operación…')).toBeNull()
@@ -346,6 +516,7 @@ test('sin capacidad de resolve el backend nunca recibe la solicitud', async () =
   const data = operationsFixture()
   const api = await enterPanel(data) // sin capabilities: como el backend Python
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  await waitFor(() => expect(screen.getByText('Martillo')).toBeTruthy())
   fireEvent.click(screen.getByText('Martillo'))
   expect(screen.queryByText('Conciliar operación…')).toBeNull()
   expect(screen.getByText(/exclusiva del backend Rust/)).toBeTruthy()
@@ -359,6 +530,7 @@ test('los rechazos del backend en la conciliación se muestran comprensibles', a
     mutation: () => ({ ok: false, body: { detail: 'La operación fallida ya no retiene recursos del dominio' } }),
   })
   fireEvent.click(screen.getByRole('button', { name: /Operaciones/ }))
+  await waitFor(() => expect(screen.getByText('Llave')).toBeTruthy())
   fireEvent.click(screen.getByText('Llave'))
   await waitFor(() => expect(screen.getByText('Conciliar operación…')).toBeTruthy())
   fireEvent.click(screen.getByText('Conciliar operación…'))

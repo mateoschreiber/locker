@@ -205,6 +205,45 @@ funciones cuando el backend conectado los anuncia:
   fija la ventana a partir de la cual la comunicación se considera `STALE`;
   configurable en `.env` para el perfil `rust`.
 
+## Listados paginados y operaciones enriquecidas (Fase 4.2)
+
+`GET /api/v1/capabilities` declara además `pagination` y
+`enriched_operations` (exclusivos del backend Rust; el panel los detecta y
+contra Python conserva el contrato de arrays completos):
+
+- **Paginación opt-in, todos los listados** (`/{entity}?limit=&offset=`):
+  sin `limit` la respuesta sigue siendo el array completo (paridad con
+  Python, consumidores existentes); con `limit` responde el envoltorio
+  explícito `{ "items": [...], "total": N, "limit": N, "offset": N }`.
+  `limit` se valida en `1..=200` y `offset` en `≥ 0` (422 fuera de rango;
+  `offset` sin `limit` y valores inválidos son 422, nunca parámetros
+  silenciosamente ignorados). Una página más allá del final responde
+  `items: []` con el `total` honesto. El orden es determinístico:
+  `created_at DESC` con desempate por `id DESC`.
+- **Operaciones enriquecidas**: `GET /api/v1/operations` con `limit`
+  responde el envoltorio con cada item enriquecido en una única consulta
+  JOIN (sin N+1): `tool_name`, `locker_code`, `compartment_code`,
+  `user_display_name`, `loan_status` y `requires_intervention` (la misma
+  elegibilidad que `resolve`: UNKNOWN, o FAILED que aún retiene un préstamo
+  pendiente). El filtro `attention=1|0` restringe el listado a esa regla y
+  requiere `limit`. Sin `limit`, `/operations` responde el array legado sin
+  enriquecer, igual que Python.
+
+### Panel: carga por vista activa (Fase 4.2)
+
+El panel ya no sondea las 14 entidades cada 4 s sin importar la vista:
+consulta únicamente los datos de la vista activa (≤3 solicitudes dinámicas),
+mantiene las entidades de referencia (sucursales, roles, usuarios, lockers y
+compartimientos) en caché refrescada tras cada mutación, suspende el sondeo
+mientras la pestaña está oculta (refresca al volver), evita ciclos
+superpuestos e ignora respuestas obsoletas al cambiar de vista. La búsqueda
+del inventario consulta al servidor en modo Rust (`q` + `status`, con
+retardo de escritura) y filtra localmente contra Python. Las tablas muestran
+nombres y códigos legibles en lugar de UUID técnicos (el UUID queda visible
+al pasar el cursor); los identificadores completos se conservan en el
+detalle de operación. Estados de carga, vacío y desactualización son
+explícitos: "Cargando…" distingue la primera carga de "Sin registros.".
+
 ## Panel de operaciones y conciliación (Fase 4.1)
 
 La vista **Operaciones** del panel supervisa el ciclo de vida completo:
@@ -245,7 +284,17 @@ duplicación ni riesgo mutuo:
 |---|---|---|---|
 | Preview interactivo | `locker-rust-preview` | 8084 | persistentes entre start/stop |
 | Smoke automatizado | `locker-rust-preview-test` | 8085 (`LOCKER_PREVIEW_TEST_PORT`) | desechables (`down -v` solo de este proyecto) |
+| Bench de rendimiento | `locker-rust-bench` | 8086 (`LOCKER_BENCH_PORT`) | desechables; solo filas sintéticas |
 | Laboratorio Python | `locker` | 8083 | nunca tocado por ninguno de los dos |
+
+`scripts/bench_panel.py` mide el rendimiento del panel sobre su propio
+stack desechable (mismo Compose del preview, proyecto y puerto propios):
+`up` siembra el LAB, `inflate --tools N --operations N --audit N` agrega
+filas sintéticas para escenarios de crecimiento, `cycle [--view V] [--minutes M]`
+repite el ciclo de sondeo — completo o solo el de una vista activa — midiendo
+latencia promedio/p95, tamaño por endpoint y `docker stats`, y `down` elimina
+todo. El procedimiento y los resultados viven en
+`docs/PERFORMANCE_BASELINE.md`.
 
 ### Uso interactivo (Windows)
 

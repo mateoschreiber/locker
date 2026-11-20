@@ -3,16 +3,18 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{postgres::PgRow, query, query_scalar, PgPool, Row};
 use uuid::Uuid;
 
-use crate::admin::ListParams;
+use crate::admin::{list, page, ListParams};
 use crate::audit::{admin_actor, audit};
 use crate::dump::dump_row;
 use crate::entities::{uuid_field, AUTHORIZATIONS, LOANS, OPERATIONS};
 use crate::error::ApiError;
 use crate::json::ValidJson;
+use sqlx::QueryBuilder;
 
 pub async fn list_authorizations(
     State(pool): State<PgPool>,
@@ -606,9 +608,117 @@ pub async fn list_loans(
     crate::admin::list(&LOANS, pool, params).await
 }
 
+/// Query params of the operations listing: the generic list params plus the
+/// `attention` filter (1/0), which mirrors the resolve eligibility rule.
+/// Fields stay explicit (no `#[serde(flatten)]`): axum's query deserializer
+/// does not support flattening, and the rejection would be a plain-text 400.
+#[derive(Deserialize)]
+pub struct OperationsParams {
+    pub q: Option<String>,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub attention: Option<String>,
+}
+
+/// The rule the panel used to duplicate client-side, now served once:
+/// an operation needs intervention when it is UNKNOWN, or FAILED while it
+/// still holds a pending loan (the same eligibility `resolve` enforces).
+const ATTENTION_SQL: &str = "o.status = 'UNKNOWN' OR (o.status = 'FAILED' \
+     AND ln.status IN ('CHECKOUT_PENDING','RETURN_PENDING'))";
+
+/// GET /operations — without `limit`, the legacy full array (Python parity).
+/// With it, the paginated envelope whose items are enriched in one JOIN
+/// query (no N+1): tool name, locker/compartiment codes, the loan's user
+/// display name and status, and the intervention flag.
 pub async fn list_operations(
     State(pool): State<PgPool>,
-    Query(params): Query<ListParams>,
+    Query(params): Query<OperationsParams>,
 ) -> Result<Json<Value>, ApiError> {
-    crate::admin::list(&OPERATIONS, pool, params).await
+    let attention = match params.attention.as_deref() {
+        None => None,
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        Some(_) => {
+            return Err(ApiError::validation("Campo 'attention': debe ser 1 o 0"));
+        }
+    };
+    let list_params = ListParams {
+        q: params.q,
+        status: params.status,
+        limit: params.limit,
+        offset: params.offset,
+    };
+    let page = match page(&list_params)? {
+        None => {
+            if attention.is_some() {
+                return Err(ApiError::validation("Campo 'attention': requiere limit"));
+            }
+            return list(&OPERATIONS, pool, list_params).await;
+        }
+        Some(page) => page,
+    };
+
+    let mut builder = QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT o.*, t.name AS tool_name, lk.code AS locker_code, \
+         c.code AS compartment_code, u.display_name AS user_display_name, \
+         ln.status AS loan_status, (",
+    );
+    builder.push(ATTENTION_SQL).push(
+        ") AS requires_intervention \
+         FROM locker_operations o \
+         JOIN tools t ON t.id = o.tool_id \
+         JOIN lockers lk ON lk.id = o.locker_id \
+         JOIN compartments c ON c.id = o.compartment_id \
+         JOIN loans ln ON ln.id = o.loan_id \
+         JOIN users u ON u.id = ln.user_id",
+    );
+    push_operation_filters(&mut builder, &list_params, attention);
+    builder.push(" ORDER BY o.created_at DESC, o.id DESC LIMIT ");
+    builder.push_bind(page.limit);
+    builder.push(" OFFSET ");
+    builder.push_bind(page.offset);
+    let rows: Vec<PgRow> = builder.build().fetch_all(&pool).await?;
+
+    let mut count_builder = QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT COUNT(*) FROM locker_operations o \
+         JOIN loans ln ON ln.id = o.loan_id",
+    );
+    push_operation_filters(&mut count_builder, &list_params, attention);
+    let total: i64 = count_builder.build().fetch_one(&pool).await?.try_get(0)?;
+
+    Ok(Json(serde_json::json!({
+        "items": rows.iter().map(dump_row).collect::<Vec<_>>(),
+        "total": total,
+        "limit": page.limit,
+        "offset": page.offset,
+    })))
+}
+
+/// WHERE fragments shared by the enriched page query and its COUNT. The
+/// joins needed for `attention` are always present in both.
+fn push_operation_filters(
+    builder: &mut QueryBuilder<'_, sqlx::Postgres>,
+    params: &ListParams,
+    attention: Option<bool>,
+) {
+    let mut has_where = false;
+    if let Some(status) = &params.status {
+        builder.push(" WHERE o.status = ").push_bind(status.clone());
+        has_where = true;
+    }
+    match attention {
+        None => {}
+        Some(_) => {
+            builder.push(if has_where { " AND " } else { " WHERE " });
+            builder
+                .push(if attention == Some(false) {
+                    "NOT ("
+                } else {
+                    "("
+                })
+                .push(ATTENTION_SQL)
+                .push(")");
+        }
+    }
 }

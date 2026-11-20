@@ -2881,3 +2881,237 @@ async fn resolve_confirmed_checkout_keeps_the_authorization_consumed() {
     .unwrap();
     assert_eq!(placements, 0);
 }
+
+// ---------------------------------------------------------------------------
+// F4.2-A: opt-in pagination, deterministic ordering and the enriched
+// operations listing (single JOIN, no N+1). The legacy bare-array contract
+// is asserted explicitly next to every new envelope behavior.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn pagination_envelope_and_legacy_array_stay_distinct_contracts() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let _lab = seed(&pool).await;
+    for code in ["TOOL-100", "TOOL-101", "TOOL-102"] {
+        query("INSERT INTO tools (id, asset_code, name, status) VALUES ($1, $2, 'T', 'AVAILABLE')")
+            .bind(Uuid::new_v4())
+            .bind(code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Legacy contract: no limit → the full bare array, like Python.
+    let (status, value) = get(&app, "/api/v1/tools").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value.is_array(), "legacy contract must stay a bare array");
+    assert_eq!(value.as_array().unwrap().len(), 5);
+
+    // Envelope contract: limit → {items, total, limit, offset}.
+    let (status, value) = get(&app, "/api/v1/tools?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["limit"], 2);
+    assert_eq!(value["offset"], 0);
+    assert_eq!(value["total"], 5);
+    assert_eq!(value["items"].as_array().unwrap().len(), 2);
+
+    // An empty page beyond the end keeps the honest total.
+    let (status, value) = get(&app, "/api/v1/tools?limit=2&offset=99").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["items"].as_array().unwrap().len(), 0);
+    assert_eq!(value["total"], 5);
+
+    // Filters combine with pagination (parameterized, same WHERE as COUNT).
+    let (status, value) = get(&app, "/api/v1/tools?q=TOOL-10&status=AVAILABLE&limit=50").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["total"], 3, "{value}");
+
+    // Param validation contract: bounded pages, explicit 422s.
+    for uri in [
+        "/api/v1/tools?limit=0",
+        "/api/v1/tools?limit=201",
+        "/api/v1/tools?offset=5",
+        "/api/v1/tools?limit=10&offset=-1",
+    ] {
+        let (status, value) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {value}");
+    }
+    let (_, value) = get(&app, "/api/v1/tools?limit=0").await;
+    assert_eq!(value["detail"], "Campo 'limit': entre 1 y 200");
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn listing_order_is_deterministic_when_timestamps_tie() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let _lab = seed(&pool).await;
+    // Rows seeded in one transaction share created_at: only the id
+    // tiebreak makes the order reproducible.
+    for code in ["A", "B", "C"] {
+        query(
+            "INSERT INTO tools (id, asset_code, name, status, created_at) \
+             VALUES ($1, $2, 'T', 'AVAILABLE', '2026-01-01T00:00:00Z')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(code)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let expected: Vec<String> =
+        query_scalar("SELECT id::text FROM tools ORDER BY created_at DESC, id DESC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(expected.len(), 5);
+    for _ in 0..2 {
+        let (status, value) = get(&app, "/api/v1/tools?limit=50").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let actual: Vec<String> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(actual, expected, "order not deterministic");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn operations_listing_enriches_in_one_query_and_filters_attention() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
+    let authorization = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/approve"),
+    )
+    .await;
+    let (_, operation) = action(
+        &app,
+        &format!("/api/v1/authorizations/{authorization}/checkout"),
+    )
+    .await;
+    let correlation = operation["correlation_id"].as_str().unwrap().to_owned();
+
+    // Legacy stays the bare array, without enrichment keys.
+    let (status, value) = get(&app, "/api/v1/operations").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(
+        value.is_array(),
+        "legacy operations contract must stay bare"
+    );
+    let row = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["correlation_id"] == correlation.as_str())
+        .unwrap();
+    assert!(row.get("tool_name").is_none(), "{row}");
+
+    // Envelope items carry the joined names, one query per page (no N+1).
+    let (status, value) = get(&app, "/api/v1/operations?limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let row = value["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["correlation_id"] == correlation.as_str())
+        .unwrap();
+    assert_eq!(row["tool_name"], "Herramienta", "{row}");
+    assert_eq!(row["locker_code"], "L1", "{row}");
+    assert_eq!(row["compartment_code"], "C", "{row}");
+    assert_eq!(row["user_display_name"], "Administrador", "{row}");
+    assert_eq!(row["loan_status"], "CHECKOUT_PENDING", "{row}");
+    assert_eq!(row["requires_intervention"], false, "{row}");
+    assert_eq!(value["total"], 1);
+
+    // The attention flag mirrors resolve eligibility, in both directions.
+    force_status(&pool, &correlation, "UNKNOWN").await;
+    let (_, value) = get(&app, "/api/v1/operations?attention=1&limit=10").await;
+    assert_eq!(value["total"], 1, "{value}");
+    let (_, value) = get(&app, "/api/v1/operations?attention=0&limit=10").await;
+    assert_eq!(value["total"], 0, "{value}");
+    force_status(&pool, &correlation, "PENDING").await;
+    let (_, value) = get(&app, "/api/v1/operations?attention=1&limit=10").await;
+    assert_eq!(value["total"], 0, "PENDING must not need intervention");
+
+    // A FAILED that still holds the pending loan is the other eligible case.
+    force_status(&pool, &correlation, "FAILED").await;
+    let (_, value) = get(&app, "/api/v1/operations?attention=1&limit=10").await;
+    assert_eq!(value["total"], 1, "{value}");
+    // A FAILED whose loan is no longer pending holds no domain resources.
+    query("UPDATE loans SET status = 'CANCELLED' WHERE tool_id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, value) = get(&app, "/api/v1/operations?attention=1&limit=10").await;
+    assert_eq!(value["total"], 0, "{value}");
+
+    // Param contract: attention requires pagination and takes only 1/0.
+    for uri in [
+        "/api/v1/operations?attention=1",
+        "/api/v1/operations?limit=10&attention=2",
+    ] {
+        let (status, value) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {value}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn paginated_polling_during_concurrent_checkouts_stays_consistent() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
+
+    let mut authorizations = Vec::new();
+    for _ in 0..2 {
+        let auth = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+        action(&app, &format!("/api/v1/authorizations/{auth}/approve")).await;
+        authorizations.push(auth);
+    }
+
+    // The panel polls the paginated listing while both checkouts race.
+    let poller = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let (status, value) = get(&app, "/api/v1/operations?limit=5&attention=1").await;
+                assert_eq!(status, StatusCode::OK, "{value}");
+                assert!(value["total"].is_i64(), "{value}");
+            }
+        })
+    };
+    let mut tasks = Vec::new();
+    for auth in authorizations {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            action(&app, &format!("/api/v1/authorizations/{auth}/checkout")).await
+        }));
+    }
+    let mut accepted = 0;
+    let mut conflict = 0;
+    for task in tasks {
+        let (status, value) = task.await.unwrap();
+        match status {
+            StatusCode::ACCEPTED => accepted += 1,
+            StatusCode::CONFLICT => conflict += 1,
+            _ => panic!("unexpected status {status}: {value}"),
+        }
+    }
+    poller.await.unwrap();
+    assert_eq!(accepted, 1);
+    assert_eq!(conflict, 1);
+    // Exactly one operation survives and the listing shows it enriched.
+    let (_, value) = get(&app, "/api/v1/operations?limit=10").await;
+    assert_eq!(value["total"], 1, "{value}");
+    assert_eq!(
+        value["items"][0]["loan_status"], "CHECKOUT_PENDING",
+        "{value}"
+    );
+}
