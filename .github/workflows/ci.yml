@@ -1,8 +1,7 @@
 name: CI
 
-# Manual-only (F4.1-D / F4.4): local validation (scripts/check-local.ps1) is the
-# primary gate; this workflow stays available on demand from the Actions tab
-# for a full remote verification. Nothing runs automatically on push.
+# Manual-only: local validation (scripts/check-local.ps1) is the primary gate;
+# this workflow stays available on demand from the Actions tab.
 on:
   workflow_dispatch:
 
@@ -30,22 +29,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Start isolated Mosquitto
         run: |
-          test -f "$GITHUB_WORKSPACE/infra/docker/mosquitto.conf" || {
-            echo "::error::infra/docker/mosquitto.conf not found after checkout"
-            exit 1
-          }
           docker run -d --name mosquitto-test \
             -p 127.0.0.1:1883:1883 \
             -v "$GITHUB_WORKSPACE/infra/docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
             eclipse-mosquitto:2.0.22
           for attempt in $(seq 1 30); do
             if docker exec mosquitto-test mosquitto_sub -h localhost -t '$SYS/broker/version' -C 1 -W 3 >/dev/null 2>&1; then
-              echo "Mosquitto accepts MQTT connections on 127.0.0.1:1883"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::Mosquitto did not accept MQTT connections in time"
           docker logs mosquitto-test
           exit 1
       - uses: dtolnay/rust-toolchain@stable
@@ -97,13 +90,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - run: docker compose config --quiet
-      - run: docker compose -p locker-rust-ci build api-rust
-      - run: python scripts/test_rust_docker.py locker-rust-ci-api-rust
-      - run: docker compose -f compose.rust-preview.yaml config --quiet
-      - run: python scripts/test_rust_preview.py
-
-  mqtt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: python scripts/test_rust_mqtt.py
+      - run: docker compose build

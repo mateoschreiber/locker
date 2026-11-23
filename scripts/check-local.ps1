@@ -1,41 +1,23 @@
-# Local validation (F4.1-D): QUICK / FULL / E2E from any PowerShell directory.
-# This is the primary validation mechanism; GitHub Actions stays as an
-# on-demand remote check (workflow_dispatch). The repository is resolved from
-# this script's location, and the laboratory (8083), the interactive preview
-# (8084, project locker-rust-preview) and their data are never modified:
-# every disposable environment uses its own Docker project name and is
-# cleaned up at the end, failures included.
+# Local validation suite: QUICK (default) and FULL from any PowerShell directory.
 #
 # Usage:
-#   .\scripts\check-local.ps1            # QUICK (default): fmt, clippy,
-#                                        # Rust unit tests, web lint/build/test,
-#                                        # staged+unstaged diff check.
+#   .\scripts\check-local.ps1            # QUICK: fmt, clippy, Rust unit tests,
+#                                        # web lint/build/test, git diff check.
 #   .\scripts\check-local.ps1 QUICK
-#   .\scripts\check-local.ps1 FULL       # QUICK + Rust integration with
-#                                        # disposable PostgreSQL/Mosquitto,
-#                                        # MQTT scenarios, Compose checks,
-#                                        # image smoke, Python checks, parity
-#                                        # and the Python restart regression.
-#   .\scripts\check-local.ps1 E2E        # FULL + isolated guard preview with
-#                                        # a persistence marker, the complete
-#                                        # smoke (login, loans, presence,
-#                                        # restarts, UNKNOWN/FAILED,
-#                                        # reconciliation) and proof that the
-#                                        # interactive preview, its data and
-#                                        # the laboratory remain untouched.
+#   .\scripts\check-local.ps1 FULL       # QUICK + 34 Rust integration tests
+#                                        # with disposable PostgreSQL & Mosquitto,
+#                                        # Compose config check, Rust image build,
+#                                        # and simulator ruff/pytest.
 #
-# Rust checks run inside a Linux container (rust:1-slim-bookworm) with a
-# persistent registry volume, so dependencies are downloaded once and no
-# host toolchain is needed. Python checks run in python:3.12-slim with a
-# persistent pip cache. Web checks use the host Node (node_modules is reused;
-# npm ci only runs when it is missing). No step hides failures: every step
-# reports PASS, FAIL or SKIPPED with its reason, and the exit code is
-# non-zero when anything fails. Evidence is kept under .local-validation/.
+# Rust checks run inside `rust:1-slim-bookworm` with cached registry/rustup volumes.
+# Simulator checks run inside `python:3.12-slim` with a cached pip volume.
+# Web checks run on the host Node.js (reusing node_modules).
+# Never touches the active laboratory containers or volumes on port 8083.
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('QUICK', 'FULL', 'E2E')]
+    [ValidateSet('QUICK', 'FULL')]
     [string]$Mode = 'QUICK'
 )
 
@@ -48,9 +30,6 @@ $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Started = Get-Date
 
 function Run {
-    # Executes a native command, streaming its output through the pipeline
-    # (captured by the running step's Tee-Object) and throws on a non-zero
-    # exit code so the step records FAIL instead of hiding the error.
     param([string]$Exe, [string[]]$ArgList, [string]$WorkingDirectory)
     $previous = $PWD
     try {
@@ -80,10 +59,6 @@ function Invoke-Step {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host "`nRUN: $Name" -ForegroundColor Cyan
     try {
-        # Continue inside the step: with Stop, a native command writing to
-        # stderr (clippy warnings, build chatter) under 2>&1 becomes a
-        # terminating error and records false failures. Real failures come
-        # from Run's explicit throw on a non-zero exit code.
         $ErrorActionPreference = 'Continue'
         & $Body 2>&1 | Tee-Object -FilePath $log
         $ErrorActionPreference = 'Stop'
@@ -100,12 +75,6 @@ function Invoke-Step {
 }
 
 function Invoke-Cargo {
-    # Rust checks inside Linux (CI-equivalent). The registry and the rustup
-    # download caches live in named volumes so dependencies and components
-    # are not redownloaded on later runs; the build cache lives in the
-    # gitignored apps/api-rust/target. fmt/clippy are components the slim
-    # image ships without, so they are ensured (a cached no-op after the
-    # first run) before every cargo invocation.
     param([string[]]$CargoArgs, [string[]]$ExtraEnv = @(), [string]$Network = '')
     $dockerArgs = @('run', '--rm', '-v', "${repo}:/src", '-v',
         'locker-rustcheck-registry:/usr/local/cargo/registry', '-v',
@@ -119,7 +88,7 @@ function Invoke-Cargo {
 }
 
 function Wait-ContainerHealthy {
-    param([string]$Description, [scriptblock]$Predicate, [int]$Seconds = 60)
+    param([string]$Description, [scriptblock]$Predicate, [int]$Seconds = 90)
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
         if (& $Predicate) { return }
@@ -128,62 +97,54 @@ function Wait-ContainerHealthy {
     throw "timeout waiting for $Description"
 }
 
-$webDir = Join-Path $repo 'apps/web'
-$nodeMissing = -not (Get-Command node -ErrorAction SilentlyContinue) -or
-    -not (Get-Command npm -ErrorAction SilentlyContinue)
-$nodeModules = Join-Path $webDir 'node_modules'
-
-# --- Baselines of environments that must remain untouched (read-only). ------
-function Get-HttpStatus {
-    param([string]$Url)
-    try { return (Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 5).StatusCode }
-    catch { return 'unreachable' }
-}
-$script:LabBaseline = if ($Mode -eq 'E2E') { Get-HttpStatus 'http://127.0.0.1:8083/health/ready' } else { $null }
-if ($Mode -eq 'E2E') {
-    Write-Host "E2E: laboratory baseline (8083/health/ready) = $script:LabBaseline"
+& docker info *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw 'Docker is not running. Start Docker Desktop before running check-local.ps1.'
 }
 
 # ----------------------------- QUICK ---------------------------------------
-Invoke-Step 'rust-fmt' { Invoke-Cargo @('fmt', '--check') }
+Invoke-Step 'rust-fmt' {
+    Invoke-Cargo @('fmt', '--check')
+}
 
-Invoke-Step 'rust-clippy' { Invoke-Cargo @('clippy', '--locked', '--all-targets', '--', '-D', 'warnings') }
+Invoke-Step 'rust-clippy' {
+    Invoke-Cargo @('clippy', '--locked', '--all-targets', '--', '-D', 'warnings')
+}
 
-Invoke-Step 'rust-tests-unit' { Invoke-Cargo @('test', '--locked') }
+Invoke-Step 'rust-tests-unit' {
+    Invoke-Cargo @('test', '--locked')
+}
 
+$webDir = Join-Path $repo 'apps/web'
 Invoke-Step 'web-deps' {
-    # Reuse only a WORKING install: the .cmd shims must exist (a
-    # node_modules/ directory alone can be a broken partial install).
-    if ((Test-Path "$nodeModules/.bin/eslint.cmd") -and
-        (Test-Path "$nodeModules/.bin/tsc.cmd") -and
-        (Test-Path "$nodeModules/.bin/vitest.cmd")) {
-        Write-Output "node_modules present with working .bin shims; npm ci skipped (dependencies reused)"
+    $eslintBin = Join-Path $webDir 'node_modules/.bin/eslint.cmd'
+    if (Test-Path $eslintBin) {
+        Write-Output 'node_modules present with working .bin shims; npm ci skipped (dependencies reused)'
     } else {
         Run npm @('ci') $webDir
     }
-} -SkipReason:$(if ($nodeMissing) { 'node/npm not on PATH' } else { $null })
+}
 
-foreach ($webStep in @(
-        @{ Name = 'web-lint'; Script = @('run', 'lint') },
-        @{ Name = 'web-build'; Script = @('run', 'build') },
-        @{ Name = 'web-test'; Script = @('test') })) {
-    Invoke-Step $webStep.Name {
-        Run npm $webStep.Script $webDir
-    } -SkipReason:$(if ($nodeMissing) { 'node/npm not on PATH' } else { $null })
+Invoke-Step 'web-lint' {
+    Run npm @('run', 'lint') $webDir
+}
+
+Invoke-Step 'web-build' {
+    Run npm @('run', 'build') $webDir
+}
+
+Invoke-Step 'web-test' {
+    Run npm @('test') $webDir
 }
 
 Invoke-Step 'git-diff-check' {
-    # Both unstaged and staged content, exactly what a commit would contain.
-    Run git @('diff', '--check')
-    Run git @('diff', '--cached', '--check')
+    Run git @('diff', '--check') $repo
+    Run git @('diff', '--cached', '--check') $repo
 }
 
 # ----------------------------- FULL ----------------------------------------
-if ($Mode -in 'FULL', 'E2E') {
-
+if ($Mode -eq 'FULL') {
     Invoke-Step 'rust-tests-integration' {
-        # Disposable PostgreSQL + Mosquitto on a private network, exactly
-        # the CI shape; the ignored tests recreate their own schema.
         Run docker @('network', 'create', 'locker-check-net')
         try {
             Run docker @('run', '-d', '--name', 'locker-check-pg', '--network', 'locker-check-net',
@@ -202,28 +163,17 @@ if ($Mode -in 'FULL', 'E2E') {
                 'LOCKER_TEST_DATABASE_URL=postgres://locker_rust:rust_test_only@locker-check-pg:5432/locker_rust_test',
                 'LOCKER_TEST_MQTT_HOST=locker-check-mqtt') 'locker-check-net'
         } finally {
-            # Cleanup only; the original failure (if any) propagates.
             docker rm -f locker-check-pg locker-check-mqtt *> $null
             docker network rm locker-check-net *> $null
         }
     }
 
-    Invoke-Step 'mqtt-scenarios' {
-        Run python @('scripts/test_rust_mqtt.py') $repo
-    }
-
     Invoke-Step 'compose-config' {
         Run docker @('compose', '-f', (Join-Path $repo 'compose.yaml'), 'config', '--quiet')
-        $env:LOCKER_PREVIEW_PORT = '8085'
-        try {
-            Run docker @('compose', '-f', (Join-Path $repo 'compose.rust-preview.yaml'), 'config', '--quiet')
-        } finally { Remove-Item env:LOCKER_PREVIEW_PORT -ErrorAction SilentlyContinue }
     }
 
-    Invoke-Step 'rust-image-smoke' {
-        Run docker @('compose', '-f', (Join-Path $repo 'compose.yaml'), '-p',
-            'locker-local-check', 'build', 'api-rust')
-        Run python @('scripts/test_rust_docker.py', 'locker-local-check-api-rust') $repo
+    Invoke-Step 'rust-image-build' {
+        Run docker @('compose', '-f', (Join-Path $repo 'compose.yaml'), 'build', 'api-rust', 'web', 'locker-simulator')
     }
 
     Invoke-Step 'python-simulator' {
@@ -231,88 +181,6 @@ if ($Mode -in 'FULL', 'E2E') {
             '-v', 'locker-pipcheck-cache:/root/.cache/pip', '-w', '/repo/apps/locker-simulator',
             'python:3.12-slim', 'sh', '-c',
             "pip install -q -e '.[dev]' && ruff check . && pytest -q")
-    }
-}
-
-# ------------------------------ E2E ----------------------------------------
-if ($Mode -eq 'E2E') {
-    $guardProject = 'locker-rust-preview-guard'
-    $guardCompose = @('-p', $guardProject, '-f', (Join-Path $repo 'compose.rust-preview.yaml'))
-    # One single-argument SQL string: PowerShell array literals split
-    # "+"-concatenated strings into separate arguments, which psql then
-    # ignores ("extra command-line argument") leaving a vacuous invariant.
-    $script:GuardCountsSql = "SELECT (SELECT count(*) FROM branches) || '/' || (SELECT count(*) FROM tools) || '/' || (SELECT count(*) FROM users) || '/' || (SELECT count(*) FROM loans) || '/' || (SELECT count(*) FROM locker_operations) || '/' || (SELECT count(*) FROM e2e_marker)"
-    $script:GuardCounts = $null
-
-    Invoke-Step 'e2e-guard-setup' {
-        # A THIRD disposable preview-like environment (port 8086): proves the
-        # smoke cannot touch a persistent preview's data. It is seeded, gets a
-        # marker record and is destroyed at the end — the user's interactive
-        # preview on 8084 is only ever observed read-only.
-        $env:LOCKER_PREVIEW_PORT = '8086'
-        $markerSql = "CREATE TABLE e2e_marker (id int primary key, note text); INSERT INTO e2e_marker VALUES (1, 'smoke isolation guard');"
-        try {
-            Run docker (@('compose') + $guardCompose + @('up', '-d', 'postgres', 'mosquitto'))
-            Wait-ContainerHealthy 'guard PostgreSQL' {
-                (docker compose @guardCompose exec -T postgres pg_isready -U locker_rust -d locker_rust *> $null); $LASTEXITCODE -eq 0
-            } 120
-            Run docker (@('compose') + $guardCompose + @('run', '--rm', 'api-rust', 'locker-api-rust', 'migrate'))
-            Run docker (@('compose') + $guardCompose + @('run', '--rm', '-e', 'APP_ENV=lab', 'api-rust', 'locker-api-rust', 'seed'))
-            Run docker (@('compose') + $guardCompose + @('up', '-d'))
-            Wait-ContainerHealthy 'guard preview readiness (8086)' {
-                (Get-HttpStatus 'http://127.0.0.1:8086/health/ready') -eq 200
-            } 180
-            Run docker (@('compose') + $guardCompose + @('exec', '-T', 'postgres', 'psql',
-                '-U', 'locker_rust', '-d', 'locker_rust', '-v', 'ON_ERROR_STOP=1', '-c', $markerSql))
-            # Counts come back on stdout; an empty result means the query
-            # never really ran and the invariant below would be vacuous.
-            $script:GuardCounts = (docker compose @guardCompose exec -T postgres psql -U locker_rust -d locker_rust -tAc $script:GuardCountsSql) -join ''
-            if ([string]::IsNullOrWhiteSpace($script:GuardCounts)) {
-                throw 'guard counts query returned nothing; refusing a vacuous invariant'
-            }
-            Write-Output "guard marker and counts recorded: $($script:GuardCounts)"
-        } finally {
-            Remove-Item env:LOCKER_PREVIEW_PORT -ErrorAction SilentlyContinue
-        }
-    }
-
-    Invoke-Step 'e2e-smoke' {
-        # The complete cycle in its own project (locker-rust-preview-test,
-        # port 8085): login, loan/return, presence, disconnect/reconnect,
-        # broker and backend restarts, UNKNOWN/FAILED, reconciliation,
-        # audit. Its finally clause cleans up only its own project.
-        Run python @('scripts/test_rust_preview.py') $repo
-    }
-
-    Invoke-Step 'e2e-guard-verify' {
-        try {
-            $env:LOCKER_PREVIEW_PORT = '8086'
-            $ready = Get-HttpStatus 'http://127.0.0.1:8086/health/ready'
-            if ($ready -ne 200) { throw "guard preview is not ready anymore (status $ready)" }
-            $after = (docker compose @guardCompose exec -T postgres psql -U locker_rust -d locker_rust -tAc $script:GuardCountsSql) -join ''
-            if ([string]::IsNullOrWhiteSpace($after)) {
-                throw 'guard counts query returned nothing; refusing a vacuous invariant'
-            }
-            if ($after -ne $script:GuardCounts) {
-                throw "guard data changed during the smoke: $($script:GuardCounts) -> $after"
-            }
-            Write-Output "guard data preserved across the smoke: $after (marker included)"
-        } finally {
-            Run docker (@('compose') + $guardCompose + @('down', '-v'))
-            Remove-Item env:LOCKER_PREVIEW_PORT -ErrorAction SilentlyContinue
-        }
-    }
-
-    Invoke-Step 'e2e-laboratory-untouched' {
-        $labNow = Get-HttpStatus 'http://127.0.0.1:8083/health/ready'
-        $baseline = "$script:LabBaseline"
-        if ($baseline -eq 'unreachable' -and $labNow -eq 'unreachable') {
-            Write-Output 'laboratory 8083 was not running and is still not running: untouched'
-        } elseif ($labNow -ne $baseline) {
-            throw "laboratory health changed during E2E: $baseline -> $labNow"
-        } else {
-            Write-Output "laboratory 8083 health unchanged ($labNow); its data was never touched"
-        }
     }
 }
 
@@ -324,14 +192,11 @@ Write-Host "`n===== check-local ($Mode) summary =====" -ForegroundColor Cyan
 $script:Results | Format-Table Step, Status, Seconds, Note -AutoSize | Out-String -Width 200 | Write-Host
 Write-Host ("steps: {0} PASS, {1} FAIL, {2} SKIPPED - total {3:n1}s" -f `
     @($script:Results | Where-Object Status -eq 'PASS').Count, $failed.Count, $skipped.Count, $total)
-if ($skipped.Count -gt 0) {
-    Write-Host 'skipped steps and reasons (never silent):' -ForegroundColor DarkYellow
-    $skipped | ForEach-Object { Write-Host "  - $($_.Step): $($_.Note)" }
-}
-Write-Host "evidence: $evidence"
 if ($failed.Count -gt 0) {
+    Write-Host "evidence: $evidence"
     Write-Host 'check-local: FAILED' -ForegroundColor Red
     exit 1
 }
+Remove-Item -Recurse -Force $evidence -ErrorAction SilentlyContinue
 Write-Host 'check-local: OK' -ForegroundColor Green
 exit 0

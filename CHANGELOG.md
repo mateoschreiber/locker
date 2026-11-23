@@ -17,7 +17,8 @@ El formato sigue [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/) y e
 - **Unificación de fuente de verdad del esquema**: `tests/api.rs`, `compose.yaml`, `compose.rust-preview.yaml` y todos los scripts (`rust-preview.ps1`, `test_rust_preview.py`, `bench_panel.py`, `test_rust_mqtt.py`, `check-local.ps1`) utilizan exclusivamente `locker-api-rust migrate` y `locker-api-rust seed`.
 
 ### Removed
-- **Retirada definitiva del backend Python (Fase 4.4)**: eliminados `apps/api/` (FastAPI, SQLAlchemy, Alembic), `compose.test.yaml`, `scripts/test_phase2_parity.py`, `scripts/test_docker_restart.py` y `apps/api-rust/tests/schema.sql`. Python se conserva únicamente para el simulador de hardware (`apps/locker-simulator`) y scripts auxiliares de validación.
+- **Retirada definitiva del backend Python (Fase 4.4)**: eliminados `apps/api/` (FastAPI, SQLAlchemy, Alembic), `compose.test.yaml`, `scripts/test_phase2_parity.py`, `scripts/test_docker_restart.py` y `apps/api-rust/tests/schema.sql`.
+- **Purga de artefactos transicionales y documentación histórica**: eliminados `compose.rust-preview.yaml`, `apps/web/nginx/rust.conf`, `scripts/rust-preview.ps1`, los 4 scripts Python externos de arnés (`bench_panel.py`, `test_rust_preview.py`, `test_rust_mqtt.py`, `test_rust_docker.py`), las bitácoras de proceso (`PLAN_MAESTRO_MIGRACION_RUST.md`, `RESUMEN_AUDITORIA.md`, `docs/PERFORMANCE_BASELINE.md`) y los stubs obsoletos de Fase 0/1 en `docs/` y `hardware/`, dejando únicamente el stack productivo en Rust y las suites de pruebas nativas.
 
 ---
 
