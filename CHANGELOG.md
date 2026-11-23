@@ -5,6 +5,22 @@ El formato sigue [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/) y e
 
 ---
 
+## [v0.5.0] — 2026-11-23 — Cierre de Migración a Rust (Fases 4.3 y 4.4)
+
+### Added
+- **Migración baseline SQLx (`apps/api-rust/migrations/20261123000001_baseline.sql`) y subcomando `locker-api-rust migrate`**: aplicación idempotente del esquema completo tanto en bases nuevas como sobre bases existentes creadas previamente con Alembic (`_sqlx_migrations`).
+- **Inicialización nativa del laboratorio en Rust (`locker-api-rust seed`, `apps/api-rust/src/seed.rs`)**: reemplaza `python -m app.modules.seed`, exigiendo `APP_ENV=lab` y base de dominio vacía con bloqueo `ACCESS EXCLUSIVE`.
+- **Prueba de integración `baseline_migration_and_lab_seed_populate_once_and_refuse_non_empty_db`** en `apps/api-rust/tests/api.rs` (34 pruebas de integración Rust).
+
+### Changed
+- **Cutover del laboratorio principal (`127.0.0.1:8083`, Fase 4.3)**: `compose.yaml` y `apps/web/nginx/default.conf` conectan el panel principal directamente a `api-rust` sobre el volumen persistente `locker_postgres_data`, habilitando presencia MQTT, paginación, operaciones enriquecidas y conciliación administrativa en el puerto `8083`.
+- **Unificación de fuente de verdad del esquema**: `tests/api.rs`, `compose.yaml`, `compose.rust-preview.yaml` y todos los scripts (`rust-preview.ps1`, `test_rust_preview.py`, `bench_panel.py`, `test_rust_mqtt.py`, `check-local.ps1`) utilizan exclusivamente `locker-api-rust migrate` y `locker-api-rust seed`.
+
+### Removed
+- **Retirada definitiva del backend Python (Fase 4.4)**: eliminados `apps/api/` (FastAPI, SQLAlchemy, Alembic), `compose.test.yaml`, `scripts/test_phase2_parity.py`, `scripts/test_docker_restart.py` y `apps/api-rust/tests/schema.sql`. Python se conserva únicamente para el simulador de hardware (`apps/locker-simulator`) y scripts auxiliares de validación.
+
+---
+
 ## [v0.4.2] — 2026-11-23 — Paginación Rust, Carga por Vista y Endurecimiento Ponytail
 
 ### Added

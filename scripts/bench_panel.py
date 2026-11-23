@@ -103,8 +103,8 @@ def cmd_up(_args):
     # Idempotent: a partially initialized stack (e.g. a failed later step)
     # keeps its schema and seed; the seed itself refuses non-empty databases.
     if psql('SELECT count(*) FROM branches') in ('', '0'):
-        compose('run', '--rm', 'init', 'alembic', 'upgrade', 'head')
-        compose('run', '--rm', 'init', 'python', '-m', 'app.modules.seed')
+        compose('run', '--rm', 'api-rust', 'locker-api-rust', 'migrate')
+        compose('run', '--rm', '-e', 'APP_ENV=lab', 'api-rust', 'locker-api-rust', 'seed')
     compose('up', '-d', 'simulator', 'api-rust', 'web-rust')
     wait_until('web /health/ready 200', lambda: health_ready())
     print('bench stack ready')

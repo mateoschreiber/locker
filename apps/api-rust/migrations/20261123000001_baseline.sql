@@ -1,9 +1,16 @@
--- shortcut: mirrors the Alembic migrations 20260817_0002/0003 for isolated Rust
--- tests; keep in sync if a migration changes, drop it when Python retires (Phase 4).
-DROP TABLE IF EXISTS audit_events, locker_operations, loans, authorizations, tool_placements,
-    tools, cameras, locker_locks, compartments, lockers, memberships, users, roles, branches CASCADE;
+-- SQLx baseline migration (F4.3/F4.4): captures the complete schema at
+-- Alembic head 20261119_0004. Uses IF NOT EXISTS so running `migrate` on an
+-- existing Alembic-created database preserves all data and records the
+-- baseline in `_sqlx_migrations`, while an empty database gets the full schema.
 
-CREATE TABLE branches (
+CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+    success BOOLEAN NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS branches (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -12,7 +19,8 @@ CREATE TABLE branches (
     status VARCHAR(32) NOT NULL,
     UNIQUE (code)
 );
-CREATE TABLE roles (
+
+CREATE TABLE IF NOT EXISTS roles (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -20,7 +28,8 @@ CREATE TABLE roles (
     name VARCHAR(100) NOT NULL,
     UNIQUE (code)
 );
-CREATE TABLE users (
+
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -30,7 +39,8 @@ CREATE TABLE users (
     status VARCHAR(32) NOT NULL,
     UNIQUE (username)
 );
-CREATE TABLE memberships (
+
+CREATE TABLE IF NOT EXISTS memberships (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -40,7 +50,8 @@ CREATE TABLE memberships (
     status VARCHAR(32) NOT NULL,
     UNIQUE (user_id, branch_id, role_id)
 );
-CREATE TABLE lockers (
+
+CREATE TABLE IF NOT EXISTS lockers (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -50,7 +61,8 @@ CREATE TABLE lockers (
     status VARCHAR(32) NOT NULL,
     UNIQUE (branch_id, code)
 );
-CREATE TABLE compartments (
+
+CREATE TABLE IF NOT EXISTS compartments (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -61,7 +73,8 @@ CREATE TABLE compartments (
     status VARCHAR(32) NOT NULL,
     UNIQUE (locker_id, code)
 );
-CREATE TABLE locker_locks (
+
+CREATE TABLE IF NOT EXISTS locker_locks (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -70,7 +83,8 @@ CREATE TABLE locker_locks (
     status VARCHAR(32) NOT NULL,
     UNIQUE (compartment_id)
 );
-CREATE TABLE cameras (
+
+CREATE TABLE IF NOT EXISTS cameras (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -78,7 +92,8 @@ CREATE TABLE cameras (
     name VARCHAR(160) NOT NULL,
     status VARCHAR(32) NOT NULL
 );
-CREATE TABLE tools (
+
+CREATE TABLE IF NOT EXISTS tools (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -90,7 +105,8 @@ CREATE TABLE tools (
     UNIQUE (asset_code),
     UNIQUE (rfid_tag)
 );
-CREATE TABLE tool_placements (
+
+CREATE TABLE IF NOT EXISTS tool_placements (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -102,7 +118,8 @@ CREATE TABLE tool_placements (
     removed_at TIMESTAMPTZ,
     reason VARCHAR(80) NOT NULL
 );
-CREATE TABLE authorizations (
+
+CREATE TABLE IF NOT EXISTS authorizations (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -112,7 +129,8 @@ CREATE TABLE authorizations (
     status VARCHAR(32) NOT NULL,
     approved_at TIMESTAMPTZ
 );
-CREATE TABLE loans (
+
+CREATE TABLE IF NOT EXISTS loans (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -123,7 +141,8 @@ CREATE TABLE loans (
     checked_out_at TIMESTAMPTZ,
     returned_at TIMESTAMPTZ
 );
-CREATE TABLE locker_operations (
+
+CREATE TABLE IF NOT EXISTS locker_operations (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -137,11 +156,12 @@ CREATE TABLE locker_operations (
     compartment_id UUID NOT NULL REFERENCES compartments (id),
     confirmed_at TIMESTAMPTZ,
     failure_reason VARCHAR(255),
-    origin VARCHAR(16) NOT NULL DEFAULT 'python',
+    origin VARCHAR(16) NOT NULL DEFAULT 'rust',
     published_at TIMESTAMPTZ,
     UNIQUE (correlation_id)
 );
-CREATE TABLE audit_events (
+
+CREATE TABLE IF NOT EXISTS audit_events (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -152,5 +172,12 @@ CREATE TABLE audit_events (
     metadata_json JSON NOT NULL
 );
 
-CREATE UNIQUE INDEX one_active_tool_placement ON tool_placements (tool_id) WHERE removed_at IS NULL;
-CREATE UNIQUE INDEX one_active_compartment_placement ON tool_placements (compartment_id) WHERE removed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_tool_placement
+    ON tool_placements (tool_id) WHERE removed_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_compartment_placement
+    ON tool_placements (compartment_id) WHERE removed_at IS NULL;
+
+INSERT INTO _sqlx_migrations (version, description, success)
+VALUES (20261123000001, 'baseline', TRUE)
+ON CONFLICT (version) DO NOTHING;

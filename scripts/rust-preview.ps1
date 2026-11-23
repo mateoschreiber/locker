@@ -56,9 +56,9 @@ function Test-Schema {
 }
 
 function Initialize-Database {
-    Write-Host 'Initializing schema and LAB seed (the seed refuses a non-empty database)...'
-    Invoke-Compose @('run', '--rm', 'init', 'alembic', 'upgrade', 'head') | Out-Null
-    Invoke-Compose @('run', '--rm', 'init', 'python', '-m', 'app.modules.seed') | Out-Null
+    Write-Host 'Initializing schema and LAB seed via locker-api-rust (refuses non-empty database)...'
+    Invoke-Compose @('run', '--rm', 'api-rust', 'locker-api-rust', 'migrate') | Out-Null
+    Invoke-Compose @('run', '--rm', '-e', 'APP_ENV=lab', 'api-rust', 'locker-api-rust', 'seed') | Out-Null
     Write-Host 'Database initialized.'
 }
 

@@ -14,6 +14,11 @@ más endurecimiento de entidades inactivas en autorizaciones/retiros, acciones
 completas en vista Operación, DNS dinámico en `nginx/default.conf` y consulta
 acotada en `locker_detail`; ver "Endurecimiento post-F4.2 (Auditoría Ponytail)"
 en el Plan Maestro.
+Actualización F4.3 y F4.4 (23-11-2026): **Migración a Rust cerrada.** Cutover
+del laboratorio principal (`8083`) a `api-rust` sobre PostgreSQL persistente,
+migración baseline SQLx (`locker-api-rust migrate`), seed nativo (`locker-api-rust seed`)
+y retirada definitiva del backend Python (`apps/api`), cerrando #6-python y
+#17-python. Python solo permanece en `apps/locker-simulator` y scripts auxiliares.
 
 ## Diagnóstico
 

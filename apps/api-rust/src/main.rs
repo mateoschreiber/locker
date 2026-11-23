@@ -1,7 +1,7 @@
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
-use locker_api_rust::{mqtt, router, Settings};
+use locker_api_rust::{mqtt, router, seed, Settings};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -14,6 +14,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = settings
         .pool()
         .map_err(|_| "invalid PostgreSQL configuration")?;
+    match std::env::args().nth(1).as_deref() {
+        Some("migrate") => {
+            seed::migrate(&pool).await?;
+            tracing::info!("database schema migration complete");
+            pool.close().await;
+            return Ok(());
+        }
+        Some("seed") => {
+            seed::seed_from_env(&pool).await?;
+            tracing::info!("laboratory LAB seed complete");
+            pool.close().await;
+            return Ok(());
+        }
+        Some(other) => {
+            return Err(
+                format!("unknown subcommand '{other}' (expected 'migrate' or 'seed')").into(),
+            );
+        }
+        None => {}
+    }
     let mqtt_ready = Arc::new(AtomicBool::new(false));
     // Presence lives with the bridge; the endpoint reads the same samples.
     let presence = locker_api_rust::new_store(Duration::from_secs(settings.mqtt.stale_seconds));

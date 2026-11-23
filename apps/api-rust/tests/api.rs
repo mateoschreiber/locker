@@ -7,7 +7,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use locker_api_rust::{new_store, router};
+use locker_api_rust::{new_store, router, seed as lab_seed};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, query, query_scalar, PgPool};
 use std::time::Duration;
@@ -45,10 +45,17 @@ async fn setup() -> (
         .connect(&url)
         .await
         .expect("connect isolated test database");
-    sqlx::raw_sql(include_str!("schema.sql"))
-        .execute(&pool)
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS _sqlx_migrations, audit_events, locker_operations, loans, \
+         authorizations, tool_placements, tools, cameras, locker_locks, compartments, \
+         lockers, memberships, users, roles, branches CASCADE;",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop previous test tables");
+    lab_seed::migrate(&pool)
         .await
-        .expect("recreate schema");
+        .expect("apply baseline schema");
     let presence = new_store(Duration::from_secs(90));
     (
         pool.clone(),
@@ -3160,4 +3167,27 @@ async fn inactive_entities_reject_authorization_and_checkout() {
         value["detail"],
         "No se puede operar con una entidad inactiva"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn baseline_migration_and_lab_seed_populate_once_and_refuse_non_empty_db() {
+    let (pool, app, _presence, _guard) = setup().await;
+    // Running migrate a second time on an already-migrated schema is a safe no-op.
+    lab_seed::migrate(&pool).await.expect("idempotent migrate");
+    lab_seed::seed_lab(&pool)
+        .await
+        .expect("seed empty lab database");
+
+    let (status, tools) = get(&app, "/api/v1/tools").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tools.as_array().unwrap().len(), 24);
+
+    let (status, compartments) = get(&app, "/api/v1/compartments").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(compartments.as_array().unwrap().len(), 24);
+
+    // Non-empty database must be rejected.
+    let err = lab_seed::seed_lab(&pool).await.unwrap_err();
+    assert!(err.contains("vacía"), "unexpected seed error: {err}");
 }

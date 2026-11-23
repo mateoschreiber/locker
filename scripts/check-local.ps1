@@ -218,20 +218,12 @@ if ($Mode -in 'FULL', 'E2E') {
         try {
             Run docker @('compose', '-f', (Join-Path $repo 'compose.rust-preview.yaml'), 'config', '--quiet')
         } finally { Remove-Item env:LOCKER_PREVIEW_PORT -ErrorAction SilentlyContinue }
-        Run docker @('compose', '-f', (Join-Path $repo 'compose.test.yaml'), 'config', '--quiet')
     }
 
     Invoke-Step 'rust-image-smoke' {
         Run docker @('compose', '-f', (Join-Path $repo 'compose.yaml'), '-p',
-            'locker-local-check', '--profile', 'rust', 'build', 'api-rust')
+            'locker-local-check', 'build', 'api-rust')
         Run python @('scripts/test_rust_docker.py', 'locker-local-check-api-rust') $repo
-    }
-
-    Invoke-Step 'python-api' {
-        Run docker @('run', '--rm', '-v', "${repo}:/repo",
-            '-v', 'locker-pipcheck-cache:/root/.cache/pip', '-w', '/repo/apps/api',
-            'python:3.12-slim', 'sh', '-c',
-            "pip install -q -e '.[dev]' && ruff check . && mypy app && pytest -q")
     }
 
     Invoke-Step 'python-simulator' {
@@ -239,14 +231,6 @@ if ($Mode -in 'FULL', 'E2E') {
             '-v', 'locker-pipcheck-cache:/root/.cache/pip', '-w', '/repo/apps/locker-simulator',
             'python:3.12-slim', 'sh', '-c',
             "pip install -q -e '.[dev]' && ruff check . && pytest -q")
-    }
-
-    Invoke-Step 'parity-python-rust' {
-        Run python @('scripts/test_phase2_parity.py') $repo
-    }
-
-    Invoke-Step 'python-restart-regression' {
-        Run python @('scripts/test_docker_restart.py') $repo
     }
 }
 
@@ -272,8 +256,8 @@ if ($Mode -eq 'E2E') {
             Wait-ContainerHealthy 'guard PostgreSQL' {
                 (docker compose @guardCompose exec -T postgres pg_isready -U locker_rust -d locker_rust *> $null); $LASTEXITCODE -eq 0
             } 120
-            Run docker (@('compose') + $guardCompose + @('run', '--rm', 'init', 'alembic', 'upgrade', 'head'))
-            Run docker (@('compose') + $guardCompose + @('run', '--rm', 'init', 'python', '-m', 'app.modules.seed'))
+            Run docker (@('compose') + $guardCompose + @('run', '--rm', 'api-rust', 'locker-api-rust', 'migrate'))
+            Run docker (@('compose') + $guardCompose + @('run', '--rm', '-e', 'APP_ENV=lab', 'api-rust', 'locker-api-rust', 'seed'))
             Run docker (@('compose') + $guardCompose + @('up', '-d'))
             Wait-ContainerHealthy 'guard preview readiness (8086)' {
                 (Get-HttpStatus 'http://127.0.0.1:8086/health/ready') -eq 200

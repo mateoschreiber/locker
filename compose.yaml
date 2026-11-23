@@ -30,97 +30,26 @@ services:
       timeout: 5s
       retries: 10
 
-  api:
-    build:
-      context: ./apps/api
-    restart: unless-stopped
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      MQTT_HOST: ${MQTT_HOST}
-      MQTT_PORT: ${MQTT_PORT}
-      APP_ENV: ${APP_ENV}
-      LOG_LEVEL: ${LOG_LEVEL}
-      TIMEZONE: ${TIMEZONE}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      mosquitto:
-        condition: service_healthy
-    networks:
-      - locker_internal
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  locker-simulator:
-    build:
-      context: ./apps/locker-simulator
-    restart: unless-stopped
-    environment:
-      MQTT_HOST: ${MQTT_HOST}
-      MQTT_PORT: ${MQTT_PORT}
-      LOCKER_ID: ${LOCKER_ID}
-      LOG_LEVEL: ${LOG_LEVEL}
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    networks:
-      - locker_internal
-
-  web:
-    build:
-      context: ./apps/web
-    restart: unless-stopped
-    depends_on:
-      api:
-        condition: service_healthy
-    ports:
-      - "${LOCKER_BIND_ADDRESS:-127.0.0.1}:8083:80"
-    networks:
-      - locker_internal
-      - locker_public
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health/live"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  rust-postgres:
-    profiles: [rust]
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: locker_rust_lab
-      POSTGRES_USER: locker_rust
-      POSTGRES_PASSWORD: rust_lab_only
-    tmpfs:
-      - /var/lib/postgresql/data
-    networks:
-      - locker_internal
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U locker_rust -d locker_rust_lab"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   api-rust:
-    profiles: [rust]
-    build: ./apps/api-rust
+    build:
+      context: ./apps/api-rust
+    restart: unless-stopped
+    command: ["sh", "-c", "locker-api-rust migrate && exec locker-api-rust"]
     environment:
-      RUST_DATABASE_URL: postgresql://locker_rust:rust_lab_only@rust-postgres:5432/locker_rust_lab
+      RUST_DATABASE_URL: ${RUST_DATABASE_URL:-postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
       RUST_BIND_ADDRESS: 0.0.0.0:8001
       RUST_DB_MAX_CONNECTIONS: ${RUST_DB_MAX_CONNECTIONS:-5}
       RUST_DB_TIMEOUT_SECONDS: ${RUST_DB_TIMEOUT_SECONDS:-3}
       RUST_MQTT_ENABLED: ${RUST_MQTT_ENABLED:-true}
-      RUST_MQTT_HOST: ${MQTT_HOST}
-      RUST_MQTT_PORT: ${MQTT_PORT}
+      RUST_MQTT_HOST: ${RUST_MQTT_HOST:-${MQTT_HOST:-mosquitto}}
+      RUST_MQTT_PORT: ${RUST_MQTT_PORT:-${MQTT_PORT:-1883}}
       RUST_MQTT_CLIENT_ID: ${RUST_MQTT_CLIENT_ID:-locker-api-rust}
       RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: ${RUST_MQTT_CONFIRM_TIMEOUT_SECONDS:-60}
       RUST_PRESENCE_STALE_SECONDS: ${RUST_PRESENCE_STALE_SECONDS:-90}
       RUST_LOG: ${RUST_LOG:-info}
+      APP_ENV: ${APP_ENV:-lab}
     depends_on:
-      rust-postgres:
+      postgres:
         condition: service_healthy
       mosquitto:
         condition: service_healthy
@@ -133,6 +62,39 @@ services:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8001 && printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3 && read -r response <&3 && [[ \"$$response\" == *\" 200 \"* ]]'"]
       interval: 10s
       timeout: 40s
+      retries: 5
+
+  locker-simulator:
+    build:
+      context: ./apps/locker-simulator
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: ${MQTT_HOST:-mosquitto}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      LOCKER_ID: ${LOCKER_ID:-LAB-LOCKER-001}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    networks:
+      - locker_internal
+
+  web:
+    build:
+      context: ./apps/web
+    restart: unless-stopped
+    depends_on:
+      api-rust:
+        condition: service_healthy
+    ports:
+      - "${LOCKER_BIND_ADDRESS:-127.0.0.1}:8083:80"
+    networks:
+      - locker_internal
+      - locker_public
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health/live"]
+      interval: 15s
+      timeout: 5s
       retries: 5
 
 volumes:

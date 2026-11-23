@@ -852,3 +852,22 @@ Revisión integral del repositorio tras F4.2 aplicando los principios Ponytail (
 
 - **`scripts/check-local.ps1 QUICK`: 8 PASS / 0 FAIL / 0 SKIPPED (103,7 s, exit 0)** — `rust-fmt` (3,3 s), `rust-clippy -D warnings` (17,6 s), `rust-tests-unit` (12 unitarias + 1 health, 37,5 s), `web-deps` (0,0 s), `web-lint` (14,9 s), `web-build` (4,3 s), `web-test` (20/20 pruebas Vitest, 25,7 s) y `git-diff-check` (0,3 s). Evidencia en `.local-validation/check-QUICK-20261123-085252/`.
 - **Checks Python en contenedor Linux (`python:3.12-slim`):** `ruff check .` (`All checks passed!`), `mypy app` (`Success: no issues found in 15 source files`) y `pytest` (`6 passed, 4 skipped in 1.19s`, exit 0).
+
+## Cierre de Fase 4.3 y Fase 4.4 — Cutover del Laboratorio y Retirada Definitiva de Python (23-11-2026)
+
+### 1. Publicación de Release `v0.4.2` y Respaldo Pre-Cutover
+- Etiquetado y subido el tag anotado `v0.4.2` a GitHub (`git push origin v0.4.2`).
+- Verificado el estado de `locker_operations` en el laboratorio antes del cambio (`2 CONFIRMED`, `0 PENDING/UNKNOWN`) y generado respaldo completo con `pg_dump` en `.local-validation/backup-pre-f43.sql`.
+
+### 2. Migración Baseline SQLx y Seed Nativo en `locker-api-rust`
+- **`apps/api-rust/migrations/20261123000001_baseline.sql`:** captura el esquema completo del head `0004` de Alembic con `CREATE TABLE IF NOT EXISTS` / `CREATE UNIQUE INDEX IF NOT EXISTS` y registro en `_sqlx_migrations`. Al ejecutarse sobre la base existente del laboratorio (`locker_postgres_data`), preserva el 100 % de los datos y registra el baseline; sobre una base nueva, crea todo el esquema.
+- **`apps/api-rust/src/seed.rs` (`locker-api-rust migrate` y `locker-api-rust seed`):** subcomandos integrados en el propio binario Rust sin dependencias adicionales. `seed` exige `APP_ENV=lab`, bloquea las 14 tablas en `ACCESS EXCLUSIVE MODE`, rechaza bases no vacías y siembra el dataset `LAB` completo (roles, sucursal `LAB`, `LAB-LOCKER-001`, 24 compartimentos, cerraduras, herramientas y ubicaciones, cámara y 3 usuarios con `admin:admin`).
+- **Fuente única del esquema en tests:** eliminado `apps/api-rust/tests/schema.sql`; las 34 pruebas de integración en `apps/api-rust/tests/api.rs` aplican `seed::migrate(&pool)` directamente e incluyen `baseline_migration_and_lab_seed_populate_once_and_refuse_non_empty_db`.
+
+### 3. Cutover del Laboratorio Principal (`8083`) y Retirada de FastAPI/Alembic
+- **`compose.yaml` y `apps/web/nginx/default.conf`:** el laboratorio principal (`127.0.0.1:8083`) apunta ahora a `api-rust:8001` (con `locker-api-rust migrate && exec locker-api-rust`) sobre `locker_postgres_data` y `mosquitto`.
+- **Retirada de Python como backend:** eliminados `apps/api/`, `compose.test.yaml`, `scripts/test_phase2_parity.py` y `scripts/test_docker_restart.py`. Python permanece exclusivamente para el simulador de hardware (`apps/locker-simulator`) y los scripts de orquestación de pruebas (`test_rust_docker.py`, `test_rust_mqtt.py`, `test_rust_preview.py`, `bench_panel.py`).
+
+### 4. Validación del Cutover y Cierre (23-11-2026)
+- **Stack principal en `http://127.0.0.1:8083` sobre `api-rust`:** contenedores `locker-postgres-1`, `locker-mosquitto-1`, `locker-api-rust-1`, `locker-locker-simulator-1` y `locker-web-1` en estado **Up (healthy)**; `GET /health/ready` → `200 {"status":"ready"}`, `GET /api/v1/capabilities` → `{"enriched_operations":true,"pagination":true,"presence":true,"resolve":true}`, `GET /api/v1/dashboard` → `24` herramientas disponibles y todo el historial de auditoría previo conservado, y tabla `_sqlx_migrations` con `20261123000001 | baseline | t`.
+- **`scripts/check-local.ps1 QUICK`: 8 PASS / 0 FAIL / 0 SKIPPED (80,2 s, exit 0)** — `rust-fmt` (2,2 s), `rust-clippy -D warnings` (14,2 s), `rust-tests-unit` (12 unitarias + 1 health, 34 de integración compiladas, 35,4 s), `web-deps` (0,0 s), `web-lint` (5,5 s), `web-build` (3,1 s), `web-test` (20/20 Vitest, 19,4 s) y `git-diff-check` (0,3 s). Evidencia en `.local-validation/check-QUICK-20261123-093507/`.

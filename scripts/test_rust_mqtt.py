@@ -76,7 +76,6 @@ def main():
     global created_network
     try:
         docker('build', '-t', RUST_IMAGE, 'apps/api-rust')
-        docker('build', '-t', PYTHON_IMAGE, 'apps/api')
         docker('build', '-t', SIM_IMAGE, 'apps/locker-simulator')
         docker('network', 'create', NETWORK)
         created_network = True
@@ -89,13 +88,10 @@ def main():
         wait_until('isolated PostgreSQL', lambda: docker(
             'exec', POSTGRES, 'pg_isready', '-U', DB_USER, '-d', DB_NAME,
             check=False).returncode == 0)
-        # One schema source of truth: the Alembic chain (0001..0004). The
-        # scenario thereby proves the incremental migration on the very base
-        # both backends share, and the Python container's own
-        # `alembic upgrade head` becomes an idempotent no-op.
+        # Initialize schema via locker-api-rust migrate (SQLx baseline).
         docker('run', '--rm', '--network', NETWORK,
-               '-e', f'DATABASE_URL=postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{POSTGRES}:5432/{DB_NAME}',
-               PYTHON_IMAGE, 'alembic', 'upgrade', 'head')
+               '-e', f'RUST_DATABASE_URL={DB_URL}',
+               RUST_IMAGE, 'locker-api-rust', 'migrate')
 
         mosquitto_conf = f'{os.getcwd()}/infra/docker/mosquitto.conf'
         docker('run', '-d', '--name', MOSQUITTO, '--network', NETWORK,
@@ -256,52 +252,28 @@ def main():
             ) == '0'
             print('mqtt scenario: restart -> pending republished -> CONFIRMED: OK')
 
-        # 5. Python/Rust coexistence on the SAME database: each backend owns
-        #    its operations (origin partition + state partition, audit #12).
-        docker('run', '-d', '--name', PYTHON_API, '--network', NETWORK, '-p', '127.0.0.1::8000',
-               '-e', f'DATABASE_URL=postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{POSTGRES}:5432/{DB_NAME}',
-               '-e', 'MQTT_HOST=mqtt', '-e', 'APP_ENV=lab', PYTHON_IMAGE)
-        created.append(PYTHON_API)
-        python_port = docker('inspect', '-f',
-                             '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}',
-                             PYTHON_API).stdout.strip()
-        python = f'http://127.0.0.1:{python_port}'
-        wait_until('python /health/ready', lambda: http('GET', python + '/health/ready')[0] == 200,
-                   seconds=90)
-
-        # Python-owned checkout: Python publishes and confirms; the Rust bridge
-        # must neither claim it nor confirm its event.
-        status, py_authorization = http('POST', python + '/api/v1/authorizations',
-                                       {'tool_id': tools[3], 'user_id': user, 'branch_id': branch})
-        assert status == 201, py_authorization
-        http('POST', python + f"/api/v1/authorizations/{py_authorization['id']}/approve")
-        status, py_operation = http('POST', python + f"/api/v1/authorizations/{py_authorization['id']}/checkout")
-        assert status == 202, py_operation
-        py_correlation = py_operation['correlation_id']
-        wait_until('python checkout CONFIRMED', lambda: psql(
-            f"SELECT status FROM locker_operations WHERE correlation_id = '{py_correlation}'"
-        ) == 'CONFIRMED')
-        assert psql(f"SELECT origin FROM locker_operations WHERE correlation_id = '{py_correlation}'") == 'python'
-        # Python audit rows carry no actor; a Rust confirmation would set one.
-        assert psql(
-            f"SELECT actor_id IS NULL FROM audit_events WHERE action = 'MQTT_CONFIRMED'"
-            f" AND entity_id = '{py_operation['id']}'"
-        ) == 't', 'the rust bridge confirmed a python-owned operation'
-        assert psql(f"SELECT status FROM loans WHERE id = '{py_operation['loan_id']}'") == 'ACTIVE'
-
-        # Rust-owned checkout with both bridges live: Rust confirms it.
+        # 5. Origin partition (audit #12): foreign-origin PENDING rows (e.g.
+        #    historical `origin='python'`) are never claimed or published by
+        #    the Rust bridge, while Rust-owned operations complete normally.
+        foreign_corr = f'foreign-{uuid4()}'
+        psql(f"""
+            INSERT INTO loans (id, tool_id, user_id, status)
+                VALUES ('00000000-0000-0000-0000-000000000099', '{tools[3]}', '{user}', 'CHECKOUT_PENDING');
+            INSERT INTO locker_operations (id, correlation_id, command_type, status, tool_id, loan_id, branch_id, locker_id, compartment_id, origin)
+                VALUES (gen_random_uuid(), '{foreign_corr}', 'CHECKOUT', 'PENDING', '{tools[3]}',
+                        '00000000-0000-0000-0000-000000000099', '{branch}',
+                        (SELECT id FROM lockers LIMIT 1), '{compartment}', 'python');
+        """)
         authorization, operation = rust_checkout(tools[4])
         correlation = operation['correlation_id']
-        wait_until('rust coexistence checkout CONFIRMED', lambda: psql(
+        wait_until('rust checkout CONFIRMED', lambda: psql(
             f"SELECT status FROM locker_operations WHERE correlation_id = '{correlation}'"
         ) == 'CONFIRMED')
-        assert psql(
-            f"SELECT actor_id IS NOT NULL FROM audit_events WHERE action = 'MQTT_CONFIRMED'"
-            f" AND entity_id = '{operation['id']}'"
-        ) == 't', 'python confirmed a rust-owned operation'
-        print('mqtt scenario: single ownership across backends on a shared database: OK')
+        assert psql(f"SELECT status FROM locker_operations WHERE correlation_id = '{foreign_corr}'") == 'PENDING', \
+            'the rust bridge claimed a non-rust operation'
+        print('mqtt scenario: single ownership partition by origin: OK')
 
-        print('Rust MQTT scenario: full flow, duplicate, outage, restart, coexistence: OK')
+        print('Rust MQTT scenario: full flow, duplicate, outage, restart, origin partition: OK')
     finally:
         for name in reversed(created):
             docker('rm', '-f', name, check=False)

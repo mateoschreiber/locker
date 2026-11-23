@@ -1,12 +1,9 @@
-# Rust preview stack (F4.1-C): the React panel connected to the isolated
-# Rust backend. Disposable by design: its own project name, network, broker
-# and volumes; nothing is shared with the laboratory stack (separate broker,
-# so no command reaches the active simulator). Initialized explicitly by
-# scripts/test_rust_preview.py (alembic upgrade + LAB seed through the
-# `init` profile). Short confirmation TTL so uncertain operations become
-# UNKNOWN quickly in smoke scenarios. The host port comes from
-# LOCKER_PREVIEW_PORT (8084 interactively, 8085 for the automated smoke's
-# separate project) so one file serves both stacks without sharing data.
+# Rust preview stack (F4.1-C / F4.4): the React panel connected to an isolated
+# Rust backend instance. Disposable by design: its own project name, network,
+# broker and volumes; nothing is shared with the laboratory stack (8083).
+# Initialized explicitly via `locker-api-rust migrate` and `locker-api-rust seed`.
+# The host port comes from LOCKER_PREVIEW_PORT (8084 interactively, 8085 for the
+# automated smoke, 8086 for bench/guard).
 services:
   postgres:
     image: postgres:17-alpine
@@ -43,20 +40,9 @@ services:
       mosquitto:
         condition: service_healthy
 
-  init:
-    # One-shot schema and seed against the preview database, run explicitly
-    # by the smoke script (never on `up`).
-    build: ./apps/api
-    profiles: [init]
-    environment:
-      DATABASE_URL: postgresql+psycopg://locker_rust:rust_test_only@postgres:5432/locker_rust
-      APP_ENV: lab
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   api-rust:
     build: ./apps/api-rust
+    command: ["sh", "-c", "locker-api-rust migrate && exec locker-api-rust"]
     environment:
       RUST_DATABASE_URL: postgresql://locker_rust:rust_test_only@postgres:5432/locker_rust
       RUST_BIND_ADDRESS: 0.0.0.0:8001
@@ -69,6 +55,7 @@ services:
       RUST_MQTT_CONFIRM_TIMEOUT_SECONDS: 5
       RUST_PRESENCE_STALE_SECONDS: 90
       RUST_LOG: info
+      APP_ENV: lab
     depends_on:
       postgres:
         condition: service_healthy

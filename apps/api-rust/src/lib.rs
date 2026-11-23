@@ -12,6 +12,7 @@ mod json;
 pub mod mqtt;
 mod operations;
 mod presence;
+pub mod seed;
 
 use axum::{
     extract::{Path, Query, State},

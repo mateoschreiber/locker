@@ -173,10 +173,10 @@ def main():
         wait_until('isolated MQTT', lambda: compose(
             'exec', '-T', 'mosquitto', 'mosquitto_sub', '-h', 'localhost',
             '-t', '$SYS/broker/version', '-C', '1', '-W', '3', check=False).returncode == 0)
-        # Explicit schema + LAB seed through the Python image (lab pattern;
-        # the seed refuses a non-empty database).
-        compose('run', '--rm', 'init', 'alembic', 'upgrade', 'head')
-        compose('run', '--rm', 'init', 'python', '-m', 'app.modules.seed')
+        # Explicit schema + LAB seed through the Rust binary (the seed refuses
+        # a non-empty database).
+        compose('run', '--rm', 'api-rust', 'locker-api-rust', 'migrate')
+        compose('run', '--rm', '-e', 'APP_ENV=lab', 'api-rust', 'locker-api-rust', 'seed')
         compose('up', '-d', 'simulator', 'api-rust', 'web-rust')
 
         wait_until('web /health/ready 200 (Rust subscribed)', lambda: call('GET', '/health/ready')[0] == 200,
