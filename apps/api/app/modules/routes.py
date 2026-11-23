@@ -308,7 +308,15 @@ def locker_detail(locker_id: UUID, session: Session = Depends(get_db)) -> dict[s
             )
         ).all()
     }
-    tools = {item.id: item for item in session.scalars(select(Tool)).all()}
+    tool_ids = [item.tool_id for item in active.values()]
+    tools = (
+        {
+            item.id: item
+            for item in session.scalars(select(Tool).where(Tool.id.in_(tool_ids))).all()
+        }
+        if tool_ids
+        else {}
+    )
     locks = (
         {
             item.compartment_id: item
@@ -347,10 +355,23 @@ def authorizations(
     return list_items(session, Authorization, item_status=status)
 
 
+def ensure_not_inactive(session: Session, checks: list[tuple[type[object], UUID]]) -> None:
+    for model, item_id in checks:
+        row = session.get(model, item_id)
+        if row is not None and getattr(row, "status", None) == "INACTIVE":
+            raise HTTPException(
+                status_code=409, detail="No se puede operar con una entidad inactiva"
+            )
+
+
 @router.post("/authorizations", status_code=201, tags=["operación"])
 def create_authorization(
     payload: AuthorizationCreate, session: Session = Depends(get_db)
 ) -> dict[str, object]:
+    ensure_not_inactive(
+        session,
+        [(Tool, payload.tool_id), (User, payload.user_id), (Branch, payload.branch_id)],
+    )
     item = Authorization(**payload.model_dump())
     session.add(item)
     session.flush()
@@ -406,6 +427,16 @@ def create_operation(
     if loan is None:
         if authorization is None:
             raise ValueError("Authorization is required for checkout")
+        ensure_not_inactive(
+            session,
+            [
+                (Tool, authorization.tool_id),
+                (User, authorization.user_id),
+                (Branch, placement.branch_id),
+                (Locker, placement.locker_id),
+                (Compartment, placement.compartment_id),
+            ],
+        )
         actual_loan = Loan(
             tool_id=authorization.tool_id,
             user_id=authorization.user_id,

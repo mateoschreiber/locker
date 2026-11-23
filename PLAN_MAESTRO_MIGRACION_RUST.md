@@ -834,3 +834,21 @@ commit en main → push opcional → CI remoto manual cuando se desee.
   nunca tocados; preview interactivo 8084 con sus datos preservados
   (`1/24/3/0/0`). El smoke validó presencia, flujo de préstamo confirmado
   por el simulador, UNKNOWN por TTL conciliado y reinicio mid-operation.
+
+## Endurecimiento post-F4.2 — Auditoría Ponytail, README Premium y Releases (23-11-2026)
+
+Revisión integral del repositorio tras F4.2 aplicando los principios Ponytail (*correct, safe, holds under load, tested, fast, lean*):
+
+- **Guardia sobre entidades `INACTIVE` en autorizaciones y retiros:** `POST /api/v1/authorizations` y `POST /api/v1/authorizations/{id}/checkout` validan en Rust y Python que la herramienta, el usuario, la sucursal (y en `checkout`, el locker y el compartimento) no estén en estado `INACTIVE`, respondiendo `409 "No se puede operar con una entidad inactiva"` con paridad verificada en `scripts/test_phase2_parity.py`, `apps/api-rust/tests/api.rs` y `apps/api/tests/test_integration.py`.
+- **Acciones operativas completas en la vista `Operación` del panel React (`apps/web/src/App.tsx`):** las tablas de **Autorizaciones** y **Préstamos** exponen los botones **Aprobar** (`PENDING`), **Retirar** (`APPROVED`), **Cancelar** (`PENDING`/`APPROVED`) y **Devolver** (`ACTIVE`), cubiertos por una nueva prueba de componente en `apps/web/src/App.test.tsx` (20/20 pruebas web).
+- **Detalle de Locker resiliente y sin full-scan:** el componente `Lockers` usa `AbortController` y manejo de error explícito al consultar `/lockers/{id}/detail`; en el backend (`apps/api-rust/src/inventory.rs` y `apps/api/app/modules/routes.py`), `locker_detail` consulta únicamente las herramientas con ubicación activa en ese locker (`WHERE id = ANY($1)` / `Tool.id.in_(tool_ids)`) en lugar de toda la tabla `tools`.
+- **Paginación extendida a `authorizations` y `loans`:** `pathFor` en `apps/web/src/App.tsx` incluye `?limit=100` para `authorizations` y `loans` cuando `capabilities.pagination` está activo.
+- **Cierre del hallazgo #20 en el puente MQTT de Rust (`apps/api-rust/src/mqtt.rs`):** la bandera `schema_ready` evita que `periodic` y `expire_published` ejecuten consultas contra una base `tmpfs` sin esquema hasta que `recover_orphans` finalice con éxito.
+- **Resolución DNS dinámica en `apps/web/nginx/default.conf`:** incorporado `resolver 127.0.0.11 valid=5s ipv6=off;` con variable `$api_upstream` (mismo patrón que resolvió el CI #23 en `rust.conf`), cerrando el riesgo residual documentado en F4.1-D.
+- **Limpieza Lean (cierre del hallazgo #18 y deduplicación SQL):** eliminadas las 12 clases Pydantic sin uso en `apps/api/app/modules/schemas.py` (-67 líneas), unificada la consulta SQL de reserva de compartimento en `operations::is_compartment_reserved` usada desde `admin.rs`, `inventory.rs` y `operations.rs`, y movidos `vite` / `@vitejs/plugin-react` a `devDependencies` con versiones semánticas fijadas en `apps/web/package.json`.
+- **Documentación y Releases (sin GitHub Actions):** renovado `README.md` con diagramas Mermaid, tablas de capacidades, matriz de entornos y guía completa; creado `CHANGELOG.md` con el historial de versiones `v0.1.0`–`v0.4.2` y el procedimiento manual para publicar en GitHub Releases.
+
+### Validación ejecutada (23-11-2026)
+
+- **`scripts/check-local.ps1 QUICK`: 8 PASS / 0 FAIL / 0 SKIPPED (103,7 s, exit 0)** — `rust-fmt` (3,3 s), `rust-clippy -D warnings` (17,6 s), `rust-tests-unit` (12 unitarias + 1 health, 37,5 s), `web-deps` (0,0 s), `web-lint` (14,9 s), `web-build` (4,3 s), `web-test` (20/20 pruebas Vitest, 25,7 s) y `git-diff-check` (0,3 s). Evidencia en `.local-validation/check-QUICK-20261123-085252/`.
+- **Checks Python en contenedor Linux (`python:3.12-slim`):** `ruff check .` (`All checks passed!`), `mypy app` (`Success: no issues found in 15 source files`) y `pytest` (`6 passed, 4 skipped in 1.19s`, exit 0).

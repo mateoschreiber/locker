@@ -541,3 +541,39 @@ test('los rechazos del backend en la conciliación se muestran comprensibles', a
     expect(screen.getByText('La operación fallida ya no retiene recursos del dominio')).toBeTruthy(),
   )
 })
+
+test('la vista Operación permite aprobar, retirar, cancelar y devolver desde las tablas', async () => {
+  const data = fixture()
+  data.authorizations = [
+    { id: 'auth-pending', status: 'PENDING', tool_id: 't1', user_id: 'u1', created_at: '2026-01-01T00:00:00Z' },
+    { id: 'auth-approved', status: 'APPROVED', tool_id: 't2', user_id: 'u1', created_at: '2026-01-01T00:00:00Z' },
+  ]
+  data.loans = [
+    { id: 'loan-active', status: 'ACTIVE', tool_id: 't3', user_id: 'u1', checked_out_at: '2026-01-01T00:00:00Z' },
+  ]
+  const api = await enterPanel(data, {
+    capabilities: { resolve: true, presence: true, pagination: true, enriched_operations: true },
+    mutation: () => ({ ok: true, body: {} }),
+  })
+  fireEvent.click(screen.getByRole('button', { name: /Operación$/ }))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Aprobar' })).toBeTruthy())
+
+  // En modo Rust con paginación, authorizations y loans también usan ?limit=100.
+  expect(api.calls.some(({ url }) => url === '/api/v1/authorizations?limit=100')).toBe(true)
+  expect(api.calls.some(({ url }) => url === '/api/v1/loans?limit=100')).toBe(true)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Aprobar' }))
+  await waitFor(() =>
+    expect(api.calls.some(({ url, init }) => url === '/api/v1/authorizations/auth-pending/approve' && init?.method === 'POST')).toBe(true),
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Retirar' }))
+  await waitFor(() =>
+    expect(api.calls.some(({ url, init }) => url === '/api/v1/authorizations/auth-approved/checkout' && init?.method === 'POST')).toBe(true),
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Devolver' }))
+  await waitFor(() =>
+    expect(api.calls.some(({ url, init }) => url === '/api/v1/loans/loan-active/return' && init?.method === 'POST')).toBe(true),
+  )
+})

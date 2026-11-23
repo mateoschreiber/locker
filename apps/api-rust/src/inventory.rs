@@ -126,17 +126,7 @@ pub async fn create_placement(
             "Herramienta o compartimiento ya tiene una ubicación activa",
         ));
     }
-    let reserved: Option<Uuid> = query_scalar(
-        // Same reservation rule as `return_loan`: a RETURN keeps the
-        // compartment reserved until it reaches a terminal, reverted state;
-        // UNKNOWN holds it because the physical outcome is indeterminable.
-        "SELECT id FROM locker_operations WHERE compartment_id = $1
-           AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN') AND command_type = 'RETURN'",
-    )
-    .bind(compartment_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if reserved.is_some() {
+    if crate::operations::is_compartment_reserved(&mut tx, compartment_id).await? {
         return Err(ApiError::conflict(
             "El compartimiento está reservado por una devolución pendiente",
         ));
@@ -204,7 +194,18 @@ pub async fn locker_detail(
             .bind(locker_id)
             .fetch_all(&pool)
             .await?;
-    let tools: Vec<PgRow> = query("SELECT * FROM tools").fetch_all(&pool).await?;
+    let tool_ids: Vec<Uuid> = active_placements
+        .iter()
+        .map(|row| row.try_get::<Uuid, _>("tool_id"))
+        .collect::<sqlx::Result<_>>()?;
+    let tools: Vec<PgRow> = if tool_ids.is_empty() {
+        Vec::new()
+    } else {
+        query("SELECT * FROM tools WHERE id = ANY($1)")
+            .bind(tool_ids)
+            .fetch_all(&pool)
+            .await?
+    };
     let compartment_ids: Vec<Uuid> = compartments
         .iter()
         .map(|row| row.try_get::<Uuid, _>("id"))

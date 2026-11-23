@@ -281,3 +281,14 @@ def test_status_contract_password_exclusion_and_guards() -> None:
         assert conflict.status_code == 409
         conflict = client.patch(f"/api/v1/compartments/{free['id']}", json={'status': 'INACTIVE'})
         assert conflict.status_code == 409
+
+        # Inactive entities cannot be authorized or checked out.
+        inactive_tool = client.post('/api/v1/tools', json={
+            'asset_code': f'TOOL-INACT-{uuid4().hex[:6]}', 'name': 'Inactiva',
+            'status': 'INACTIVE'})
+        assert inactive_tool.status_code == 201
+        conflict = client.post('/api/v1/authorizations', json={
+            'tool_id': inactive_tool.json()['id'], 'user_id': admin['id'],
+            'branch_id': branch['id']})
+        assert conflict.status_code == 409
+        assert conflict.json()['detail'] == 'No se puede operar con una entidad inactiva'

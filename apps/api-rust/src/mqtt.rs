@@ -94,11 +94,14 @@ async fn run_bridge(
     // schema may not exist yet (fresh lab database): retry in the background
     // instead of blocking or dying, so the subscription starts regardless.
     let recovery_pool = pool.clone();
+    let schema_ready = Arc::new(AtomicBool::new(false));
+    let recovery_ready = schema_ready.clone();
     tokio::spawn(async move {
         while let Err(error) = recover_orphans(&recovery_pool).await {
             tracing::warn!(?error, "mqtt_startup_recovery_pending");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        recovery_ready.store(true, Ordering::Relaxed);
     });
     let client_id = format!("{}-{}", settings.client_id, Uuid::new_v4().simple());
     let options = MqttOptions::new(client_id, settings.host.clone(), settings.port);
@@ -183,16 +186,13 @@ async fn run_bridge(
                 }
                 Err(_) => {} // poll tick: periodic work below
             }
-            periodic(
-                &pool,
-                &client,
-                &mut in_flight,
-                subscribed.load(Ordering::Relaxed),
-            )
-            .await;
+            let ready = subscribed.load(Ordering::Relaxed) && schema_ready.load(Ordering::Relaxed);
+            periodic(&pool, &client, &mut in_flight, ready).await;
             if Instant::now() >= next_sweep {
-                if let Err(error) = expire_published(&pool, settings.confirm_timeout).await {
-                    tracing::error!(?error, "mqtt_ttl_sweep_failed");
+                if ready {
+                    if let Err(error) = expire_published(&pool, settings.confirm_timeout).await {
+                        tracing::error!(?error, "mqtt_ttl_sweep_failed");
+                    }
                 }
                 next_sweep = Instant::now() + SWEEP_INTERVAL;
             }

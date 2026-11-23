@@ -77,6 +77,8 @@ export function App() {
     }
     if (key === 'operations') return caps.pagination ? '/operations?limit=100' : '/operations'
     if (key === 'audit') return caps.pagination ? '/audit?limit=100' : '/audit'
+    if (key === 'authorizations') return caps.pagination ? '/authorizations?limit=100' : '/authorizations'
+    if (key === 'loans') return caps.pagination ? '/loans?limit=100' : '/loans'
     return `/${key}`
   }
 
@@ -224,8 +226,21 @@ function Inventory({ tools, query, setQuery, selected, setSelected, loading }: {
 }
 
 function Lockers({ lockers, presence, selected, onSelect, loading }: { lockers: Item[]; presence: Item[]; selected: Item | null; onSelect: (item: Item) => void; loading: boolean }) {
-  const [detail, setDetail] = useState<Item | null>(null)
-  useEffect(() => { if (selected?.id) void request(`/lockers/${selected.id}/detail`).then((item) => setDetail(item as Item)) }, [selected])
+  const [detailState, setDetailState] = useState<{ id: string; item: Item | null; error: string }>({ id: '', item: null, error: '' })
+  useEffect(() => {
+    const id = selected?.id ? String(selected.id) : ''
+    if (!id) return
+    const controller = new AbortController()
+    void request(`/lockers/${id}/detail`, undefined, controller.signal)
+      .then((item) => setDetailState({ id, item: item as Item, error: '' }))
+      .catch((reason: unknown) => {
+        if (reason instanceof DOMException && reason.name === 'AbortError') return
+        setDetailState({ id, item: null, error: reason instanceof Error ? reason.message : 'No se pudo cargar el detalle del locker' })
+      })
+    return () => controller.abort()
+  }, [selected?.id])
+  const detail = selected?.id && detailState.id === String(selected.id) ? detailState.item : null
+  const detailError = selected?.id && detailState.id === String(selected.id) ? detailState.error : ''
   const compartments = (detail?.compartments as unknown as Item[] | undefined) ?? []
   // Observed presence per locker; the columns only appear when the backend
   // provides the data, so the Python panel shows the plain list.
@@ -236,13 +251,19 @@ function Lockers({ lockers, presence, selected, onSelect, loading }: { lockers: 
   })
   const presenceColumns = presence.length ? ['presence', 'last_communication'] : []
   const selectedPresence = selected ? observed.get(String(selected.id)) : undefined
-  return <div className="split"><section className="panel"><h2>Lockers</h2><Table items={rows} columns={['code', 'name', 'status', ...presenceColumns]} onSelect={onSelect} label="Lockers" loading={loading} /></section><section className="panel"><h2>{selected ? `Locker ${text(selected.code)}` : 'Detalle del locker'}</h2>{selected ? <>{selectedPresence && <p className="presence-line">Presencia observada: <Badge value={text(selectedPresence.presence)} />{text(selectedPresence.ambiguous_code) === 'true' ? ' (código duplicado: no atribuible)' : ` — última comunicación ${date(selectedPresence.last_communication)}`}</p>}<div className="compartments">{compartments.map((item) => <article key={text(item.id)} className={item.tool ? 'occupied' : ''}><b>{text(item.code)}</b><span>{item.tool ? text((item.tool as unknown as Item).asset_code) : 'Libre'}</span><small>{text((item.lock as unknown as Item | undefined)?.status ?? 'Sin cerradura')}</small></article>)}</div></> : <p>Seleccione un locker para ver sus compartimientos.</p>}</section></div>
+  return <div className="split"><section className="panel"><h2>Lockers</h2><Table items={rows} columns={['code', 'name', 'status', ...presenceColumns]} onSelect={onSelect} label="Lockers" loading={loading} /></section><section className="panel"><h2>{selected ? `Locker ${text(selected.code)}` : 'Detalle del locker'}</h2>{detailError && <p className="message error">{detailError}<button onClick={() => setDetailState({ id: '', item: null, error: '' })}>×</button></p>}{selected ? <>{selectedPresence && <p className="presence-line">Presencia observada: <Badge value={text(selectedPresence.presence)} />{text(selectedPresence.ambiguous_code) === 'true' ? ' (código duplicado: no atribuible)' : ` — última comunicación ${date(selectedPresence.last_communication)}`}</p>}<div className="compartments">{compartments.map((item) => <article key={text(item.id)} className={item.tool ? 'occupied' : ''}><b>{text(item.code)}</b><span>{item.tool ? text((item.tool as unknown as Item).asset_code) : 'Libre'}</span><small>{text((item.lock as unknown as Item | undefined)?.status ?? 'Sin cerradura')}</small></article>)}</div></> : <p>Seleccione un locker para ver sus compartimientos.</p>}</section></div>
 }
 
 function Operations({ data, post, lookup }: { data: Data; post: (p: string, b?: Item) => Promise<void>; lookup: (entity: string, id: unknown) => Item | null }) { const [tool, setTool] = useState(''); const [user, setUser] = useState(''); const branch = data.branches?.[0]?.id ?? ''
   const nameOf = (entity: string, value: unknown, render: (item: Item) => string) => <span title={String(value)}>{lookup(entity, value) ? render(lookup(entity, value)!) : '—'}</span>
   const format = { tool_id: (value: unknown) => nameOf('tools', value, (item) => `${text(item.asset_code)} — ${text(item.name)}`), user_id: (value: unknown) => nameOf('users', value, (item) => text(item.display_name)) }
-  return <><div className="split"><section className="panel"><h2>Nueva autorización</h2><form onSubmit={(e) => { e.preventDefault(); void post('/authorizations', { tool_id: tool, user_id: user, branch_id: String(branch) }) }}><select value={tool} onChange={(e) => setTool(e.target.value)} aria-label="Herramienta" required><option value="">Herramienta</option>{data.tools?.filter((i) => i.status === 'AVAILABLE').map((i) => <option value={text(i.id)} key={text(i.id)}>{text(i.asset_code)} — {text(i.name)}</option>)}</select><select value={user} onChange={(e) => setUser(e.target.value)} aria-label="Usuario" required><option value="">Usuario</option>{data.users?.filter((i) => i.status === 'ACTIVE').map((i) => <option value={text(i.id)} key={text(i.id)}>{text(i.display_name)}</option>)}</select><button>Crear autorización</button></form></section><section className="panel"><h2>Flujo simulado</h2><p>El panel solicita abrir el compartimiento. El simulador confirma la acción por MQTT y actualiza el préstamo.</p><span className="legend">Actualización automática cada 4 segundos</span></section></div><section className="panel"><h2>Autorizaciones</h2><Table items={data.authorizations ?? []} columns={['status', 'tool_id', 'user_id', 'created_at']} format={format} label="Autorizaciones" /></section><section className="panel"><h2>Préstamos</h2><Table items={data.loans ?? []} columns={['status', 'tool_id', 'user_id', 'checked_out_at']} format={format} label="Préstamos" /></section></> }
+  const authActions = (item: Item) => <>
+    {item.status === 'PENDING' && <button onClick={() => void post(`/authorizations/${item.id}/approve`)}>Aprobar</button>}
+    {item.status === 'APPROVED' && <button onClick={() => void post(`/authorizations/${item.id}/checkout`)}>Retirar</button>}
+    {(item.status === 'PENDING' || item.status === 'APPROVED') && <button className="quiet" onClick={() => void post(`/authorizations/${item.id}/cancel`)}>Cancelar</button>}
+  </>
+  const loanActions = (item: Item) => <>{item.status === 'ACTIVE' && <button onClick={() => void post(`/loans/${item.id}/return`)}>Devolver</button>}</>
+  return <><div className="split"><section className="panel"><h2>Nueva autorización</h2><form onSubmit={(e) => { e.preventDefault(); void post('/authorizations', { tool_id: tool, user_id: user, branch_id: String(branch) }) }}><select value={tool} onChange={(e) => setTool(e.target.value)} aria-label="Herramienta" required><option value="">Herramienta</option>{data.tools?.filter((i) => i.status === 'AVAILABLE').map((i) => <option value={text(i.id)} key={text(i.id)}>{text(i.asset_code)} — {text(i.name)}</option>)}</select><select value={user} onChange={(e) => setUser(e.target.value)} aria-label="Usuario" required><option value="">Usuario</option>{data.users?.filter((i) => i.status === 'ACTIVE').map((i) => <option value={text(i.id)} key={text(i.id)}>{text(i.display_name)}</option>)}</select><button>Crear autorización</button></form></section><section className="panel"><h2>Flujo simulado</h2><p>El panel solicita abrir el compartimiento. El simulador confirma la acción por MQTT y actualiza el préstamo.</p><span className="legend">Actualización automática cada 4 segundos</span></section></div><section className="panel"><h2>Autorizaciones</h2><Table items={data.authorizations ?? []} columns={['status', 'tool_id', 'user_id', 'created_at']} format={format} actions={authActions} label="Autorizaciones" /></section><section className="panel"><h2>Préstamos</h2><Table items={data.loans ?? []} columns={['status', 'tool_id', 'user_id', 'checked_out_at']} format={format} actions={loanActions} label="Préstamos" /></section></> }
 // ---------------------------------------------------------------------------
 // F4.1-B: operations supervision and administrative reconciliation.
 // ---------------------------------------------------------------------------

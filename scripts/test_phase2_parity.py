@@ -287,6 +287,15 @@ def main():
         error_parity(python_base, rust_base, 'empty status', 'PATCH',
                      f"/api/v1/branches/{branch['id']}", {'status': ''}, expected=422)
 
+        # Inactive entities reject authorization in both backends with the same 409 detail.
+        _, inactive_tool = http('POST', rust_base + '/api/v1/tools',
+                                {'asset_code': f'INACT-{uuid4().hex[:8]}',
+                                 'name': 'Inactiva', 'status': 'INACTIVE'})
+        error_parity(python_base, rust_base, 'authorize inactive tool', 'POST',
+                     '/api/v1/authorizations',
+                     {'tool_id': inactive_tool['id'], 'user_id': user['id'],
+                      'branch_id': branch['id']}, expected=409)
+
         # 7. Parity of the detail endpoints after the flow.
         _, python_detail = http('GET', python_base + f"/api/v1/lockers/{locker['id']}/detail")
         _, rust_detail = http('GET', rust_base + f"/api/v1/lockers/{locker['id']}/detail")

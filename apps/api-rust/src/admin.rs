@@ -175,19 +175,10 @@ async fn guard_status_change(
             .fetch_optional(&mut **tx)
             .await?;
             let blocked = match blocked {
-                Some(id) => Some(id),
-                None => {
-                    query_scalar(
-                        "SELECT id FROM locker_operations WHERE compartment_id = $1
-                       AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN')
-                       AND command_type = 'RETURN'",
-                    )
-                    .bind(item_id)
-                    .fetch_optional(&mut **tx)
-                    .await?
-                }
+                Some(_) => true,
+                None => crate::operations::is_compartment_reserved(tx, item_id).await?,
             };
-            if blocked.is_some() {
+            if blocked {
                 return Err(ApiError::conflict(
                     "El compartimiento tiene una ubicación activa o una devolución pendiente",
                 ));

@@ -24,6 +24,8 @@ pub async fn list_authorizations(
 }
 
 /// POST /authorizations — tool, user and branch UUIDs validated; FKs enforced by PostgreSQL.
+/// Inactive entities (`status = 'INACTIVE'`) are rejected with 409 so decommissioned
+/// tools, users or branches cannot be authorized.
 pub async fn create_authorization(
     State(pool): State<PgPool>,
     ValidJson(payload): ValidJson,
@@ -32,6 +34,15 @@ pub async fn create_authorization(
     let user_id = uuid_field(&payload, "user_id")?;
     let branch_id = uuid_field(&payload, "branch_id")?;
     let mut tx = pool.begin().await?;
+    ensure_not_inactive(
+        &mut tx,
+        &[
+            ("tools", tool_id),
+            ("users", user_id),
+            ("branches", branch_id),
+        ],
+    )
+    .await?;
     let row: PgRow = query(
         "INSERT INTO authorizations (id, tool_id, user_id, branch_id, status)
          VALUES ($1, $2, $3, $4, 'PENDING') RETURNING *",
@@ -168,7 +179,7 @@ pub async fn checkout(
     }
 
     // status == APPROVED: lock the tool, then enforce one active loan per tool.
-    query("SELECT id FROM tools WHERE id = $1 FOR UPDATE")
+    let tool_status: String = query_scalar("SELECT status FROM tools WHERE id = $1 FOR UPDATE")
         .bind(tool_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -201,6 +212,25 @@ pub async fn checkout(
     };
 
     let user_id: Uuid = authorization.try_get("user_id")?;
+    let branch_id: Uuid = placement.try_get("branch_id")?;
+    let locker_id: Uuid = placement.try_get("locker_id")?;
+    let compartment_id: Uuid = placement.try_get("compartment_id")?;
+    if tool_status == "INACTIVE" {
+        return Err(ApiError::conflict(
+            "No se puede operar con una entidad inactiva",
+        ));
+    }
+    ensure_not_inactive(
+        &mut tx,
+        &[
+            ("users", user_id),
+            ("branches", branch_id),
+            ("lockers", locker_id),
+            ("compartments", compartment_id),
+        ],
+    )
+    .await?;
+
     let loan: PgRow = query(
         "INSERT INTO loans (id, tool_id, user_id, authorization_id, status)
          VALUES ($1, $2, $3, $4, 'CHECKOUT_PENDING') RETURNING *",
@@ -221,9 +251,9 @@ pub async fn checkout(
         "CHECKOUT",
         tool_id,
         loan_id,
-        placement.try_get("branch_id")?,
-        placement.try_get("locker_id")?,
-        placement.try_get("compartment_id")?,
+        branch_id,
+        locker_id,
+        compartment_id,
     )
     .await?;
     let operation_id: Uuid = operation.try_get("id")?;
@@ -307,17 +337,7 @@ pub async fn return_loan(
             "El compartimiento de destino está ocupado",
         ));
     }
-    let reserved: Option<Uuid> = query_scalar(
-        // A pending-ish RETURN reserves the compartment until it reaches a
-        // terminal state; UNKNOWN keeps the reservation because the physical
-        // outcome is indeterminable (corrección C).
-        "SELECT id FROM locker_operations WHERE compartment_id = $1
-          AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN') AND command_type = 'RETURN'",
-    )
-    .bind(compartment_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if reserved.is_some() {
+    if is_compartment_reserved(&mut tx, compartment_id).await? {
         return Err(ApiError::conflict(
             "El compartimiento está reservado por una devolución pendiente",
         ));
@@ -542,6 +562,45 @@ pub async fn revert_pending_loan(
                 .await?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Shared reservation check across `return_loan`, `create_placement` and
+/// `guard_status_change`: a RETURN operation in any non-terminal state holds
+/// its target compartment reserved until confirmed or reverted.
+pub async fn is_compartment_reserved(
+    conn: &mut sqlx::PgConnection,
+    compartment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let reserved: Option<Uuid> = query_scalar(
+        "SELECT id FROM locker_operations WHERE compartment_id = $1
+           AND status IN ('PENDING','PUBLISHING','PUBLISHED','UNKNOWN')
+           AND command_type = 'RETURN'",
+    )
+    .bind(compartment_id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(reserved.is_some())
+}
+
+/// Rejects operating on entities whose administrative status is `INACTIVE`.
+/// Missing rows are left untouched so PostgreSQL FK checks report 422 as before.
+async fn ensure_not_inactive(
+    conn: &mut sqlx::PgConnection,
+    checks: &[(&str, Uuid)],
+) -> Result<(), ApiError> {
+    for (table, id) in checks {
+        let status: Option<String> =
+            query_scalar(&format!("SELECT status FROM {table} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if status.as_deref() == Some("INACTIVE") {
+            return Err(ApiError::conflict(
+                "No se puede operar con una entidad inactiva",
+            ));
+        }
     }
     Ok(())
 }

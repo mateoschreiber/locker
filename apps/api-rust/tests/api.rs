@@ -3115,3 +3115,49 @@ async fn paginated_polling_during_concurrent_checkouts_stays_consistent() {
         "{value}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires LOCKER_TEST_DATABASE_URL and isolated PostgreSQL"]
+async fn inactive_entities_reject_authorization_and_checkout() {
+    let (pool, app, _presence, _guard) = setup().await;
+    let lab = seed(&pool).await;
+    place(&pool, lab.tool, lab.branch, lab.locker, lab.compartment).await;
+
+    // Deactivated tool cannot be authorized.
+    query("UPDATE tools SET status = 'INACTIVE' WHERE id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, value) = post(
+        &app,
+        "/api/v1/authorizations",
+        json!({ "tool_id": lab.tool, "user_id": lab.admin, "branch_id": lab.branch }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        value["detail"],
+        "No se puede operar con una entidad inactiva"
+    );
+
+    // Re-activate tool, create & approve authorization, then deactivate locker before checkout.
+    query("UPDATE tools SET status = 'AVAILABLE' WHERE id = $1")
+        .bind(lab.tool)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let auth = create_authorization(&app, lab.tool, lab.admin, lab.branch).await;
+    action(&app, &format!("/api/v1/authorizations/{auth}/approve")).await;
+    query("UPDATE lockers SET status = 'INACTIVE' WHERE id = $1")
+        .bind(lab.locker)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, value) = action(&app, &format!("/api/v1/authorizations/{auth}/checkout")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        value["detail"],
+        "No se puede operar con una entidad inactiva"
+    );
+}
